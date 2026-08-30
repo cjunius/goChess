@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,19 @@ const (
 	drawScore = 0
 	infinity  = 1 << 30
 	maxPly    = 64
+	// mateThreshold is the smallest score still considered "a mate": any score
+	// at least this big encodes a forced mate for the side to move.
+	mateThreshold = mateScore - maxPly
+
+	// nmpMinDepth is the shallowest depth at which null-move pruning is tried.
+	nmpMinDepth = 3
+	// lmrMinDepth / lmrMinMove gate late move reductions: only in subtrees at
+	// least this deep, and only for quiet moves this far down the ordered list.
+	lmrMinDepth = 3
+	lmrMinMove  = 3
+	// historyMax caps a history counter so repeated cut-offs cannot dwarf the
+	// capture scores in move ordering.
+	historyMax = 1 << 22
 )
 
 // SearchParams controls a single Search call.
@@ -51,6 +65,13 @@ type searcher struct {
 	nodes    int64
 	deadline time.Time
 	stopped  bool
+
+	// killers holds, per ply, up to two quiet moves that most recently caused a
+	// beta cut-off at that ply; history accumulates depth^2 for every quiet move
+	// that caused a cut-off, indexed by [side][from][to]. Both are per-searcher,
+	// so Lazy-SMP workers keep independent tables and need no synchronisation.
+	killers [maxPly + 1][2]dragontoothmg.Move
+	history [2][64][64]int
 }
 
 func (s *searcher) timeUp() bool {
@@ -159,7 +180,7 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 			break // out of time: keep the previous completed depth
 		}
 		res.BestMove, res.Score, res.Depth = move, score, depth
-		if score >= mateScore-maxPly || score <= -mateScore+maxPly {
+		if score >= mateThreshold || score <= -mateThreshold {
 			if s.stop != nil {
 				s.stop.Store(true) // forced mate: let the other workers stop too
 			}
@@ -177,12 +198,12 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 	key := b.Hash()
 	_, ttMove, _ := s.tt.probe(key, depth, -infinity, infinity, 0)
 
-	moves := orderMoves(b, b.GenerateLegalMoves(), ttMove)
+	moves := s.orderMoves(b, b.GenerateLegalMoves(), ttMove, 0)
 	alpha, beta := -infinity, infinity
 	bestScore := -infinity
 	for _, m := range moves {
 		unapply := b.Apply(m)
-		v := -s.negamax(b, depth-1, -beta, -alpha, 1)
+		v := -s.negamax(b, depth-1, -beta, -alpha, 1, true)
 		unapply()
 		if s.stopped {
 			return 0, dragontoothmg.Move(0), false
@@ -198,23 +219,40 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 	return bestScore, best, true
 }
 
-func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int) int {
+// outOfTime bumps the node counter and, every 2048 nodes, checks the clock. It
+// latches s.stopped (and the shared stop flag) so every frame unwinds fast.
+func (s *searcher) outOfTime() bool {
 	s.nodes++
-	if s.nodes&2047 == 0 && s.timeUp() {
-		s.stopped = true
-		if s.stop != nil {
-			s.stop.Store(true)
-		}
+	if s.nodes&2047 != 0 || !s.timeUp() {
+		return false
+	}
+	s.stopped = true
+	if s.stop != nil {
+		s.stop.Store(true)
+	}
+	return true
+}
+
+// terminalScore handles the non-search node types: a captured king, the
+// fifty-move rule, and the quiescence hand-off at the horizon.
+func (s *searcher) terminalScore(b *dragontoothmg.Board, depth, alpha, beta, ply int) (int, bool) {
+	switch {
+	case b.White.Kings == 0 || b.Black.Kings == 0:
+		return kingCaptureScore(b, ply), true
+	case b.Halfmoveclock >= 100:
+		return drawScore, true
+	case depth <= 0:
+		return s.quiesce(b, alpha, beta, ply), true
+	}
+	return 0, false
+}
+
+func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, canNull bool) int {
+	if s.outOfTime() {
 		return 0
 	}
-	if b.White.Kings == 0 || b.Black.Kings == 0 {
-		return kingCaptureScore(b, ply)
-	}
-	if b.Halfmoveclock >= 100 {
-		return drawScore
-	}
-	if depth <= 0 {
-		return s.quiesce(b, alpha, beta, ply)
+	if v, done := s.terminalScore(b, depth, alpha, beta, ply); done {
+		return v
 	}
 
 	alphaOrig := alpha
@@ -224,9 +262,14 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int) 
 		return ttScore
 	}
 
+	inCheck := b.OurKingInCheck()
+	if v, ok := s.tryNullMove(b, depth, beta, ply, canNull, inCheck); ok {
+		return v
+	}
+
 	moves := b.GenerateLegalMoves()
 	if len(moves) == 0 {
-		if b.OurKingInCheck() {
+		if inCheck {
 			return -mateScore + ply // checkmate; prefer the shortest mate
 		}
 		return drawScore // stalemate
@@ -234,10 +277,8 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int) 
 
 	best := -infinity
 	var bestMove dragontoothmg.Move
-	for _, m := range orderMoves(b, moves, ttMove) {
-		unapply := b.Apply(m)
-		v := -s.negamax(b, depth-1, -beta, -alpha, ply+1)
-		unapply()
+	for i, m := range s.orderMoves(b, moves, ttMove, ply) {
+		v := s.searchMove(b, m, i, depth, alpha, beta, ply, inCheck)
 		if s.stopped {
 			return 0
 		}
@@ -248,6 +289,9 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int) 
 			alpha = v
 		}
 		if alpha >= beta {
+			if isQuiet(b, m) {
+				s.recordCutoff(b, m, depth, ply)
+			}
 			break // fail-high: opponent won't enter this line
 		}
 	}
@@ -261,6 +305,62 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int) 
 	}
 	s.tt.store(key, depth, best, bound, bestMove, ply)
 	return best
+}
+
+// searchMove applies m, searches the resulting position, and returns its score
+// from the current side's point of view. Late quiet moves are first searched at
+// a reduced depth (LMR); a reduced search that beats alpha is repeated at full
+// depth so the true score is never lost.
+func (s *searcher) searchMove(b *dragontoothmg.Board, m dragontoothmg.Move, moveIdx, depth, alpha, beta, ply int, inCheck bool) int {
+	quiet := isQuiet(b, m)
+	unapply := b.Apply(m)
+	defer unapply()
+	givesCheck := b.OurKingInCheck()
+
+	newDepth := depth - 1
+	if depth >= lmrMinDepth && moveIdx >= lmrMinMove && quiet && !inCheck && !givesCheck {
+		red := 1
+		if moveIdx >= 6 && depth >= 5 {
+			red = 2
+		}
+		v := -s.negamax(b, newDepth-red, -alpha-1, -alpha, ply+1, true)
+		if v <= alpha {
+			return v // stays fail-low even at full depth: no re-search needed
+		}
+	}
+	return -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+}
+
+// tryNullMove implements null-move pruning: if handing the opponent a free move
+// still leaves the static evaluation at or above beta, the position is good
+// enough that a full search is very unlikely to drop below beta, so return a
+// cut-off. Skipped in check, in shallow subtrees, when the side to move has only
+// pawns (the classic zugzwang trap), when beta is already a mate score, or
+// immediately after another null move. Returns (score, true) when it cuts.
+func (s *searcher) tryNullMove(b *dragontoothmg.Board, depth, beta, ply int, canNull, inCheck bool) (int, bool) {
+	if !canNull || inCheck || depth < nmpMinDepth || beta >= mateThreshold {
+		return 0, false
+	}
+	if !hasNonPawnMaterial(b) || Evaluate(b) < beta {
+		return 0, false
+	}
+
+	r := 2
+	if depth >= 6 {
+		r = 3
+	}
+	nb := nullMoveBoard(b)
+	score := -s.negamax(&nb, depth-1-r, -beta, -beta+1, ply+1, false)
+	if s.stopped {
+		return 0, true // value ignored; the caller re-checks s.stopped
+	}
+	if score >= beta {
+		if score >= mateThreshold {
+			score = beta // a mate found only past a null move is not proven
+		}
+		return score, true
+	}
+	return 0, false
 }
 
 // quiesce searches only "loud" moves (captures and promotions) past the horizon
@@ -281,7 +381,7 @@ func (s *searcher) quiesce(b *dragontoothmg.Board, alpha, beta, ply int) int {
 		return stand
 	}
 
-	for _, m := range orderMoves(b, b.GenerateLegalMoves(), 0) {
+	for _, m := range s.orderMoves(b, b.GenerateLegalMoves(), 0, ply) {
 		if !dragontoothmg.IsCapture(m, b) && m.Promote() == dragontoothmg.Nothing {
 			continue
 		}
@@ -301,6 +401,22 @@ func (s *searcher) quiesce(b *dragontoothmg.Board, alpha, beta, ply int) int {
 	return alpha
 }
 
+// recordCutoff credits a quiet move that produced a beta cut-off: it becomes a
+// killer for its ply and its history counter grows by depth^2.
+func (s *searcher) recordCutoff(b *dragontoothmg.Board, m dragontoothmg.Move, depth, ply int) {
+	if ply >= 0 && ply <= maxPly {
+		k := &s.killers[ply]
+		if k[0] != m {
+			k[1] = k[0]
+			k[0] = m
+		}
+	}
+	h := &s.history[sideIndex(b)][m.From()][m.To()]
+	if *h += depth * depth; *h > historyMax {
+		*h = historyMax
+	}
+}
+
 // kingCaptureScore scores the illegal position left when a previous ply captured
 // a king. dragontoothmg can generate such a move when the position it is given
 // has the side *not* to move in check; without this guard the next
@@ -317,10 +433,55 @@ func kingCaptureScore(b *dragontoothmg.Board, ply int) int {
 	return mateScore - ply // the opponent's king is gone
 }
 
+// sideIndex is 0 for White to move, 1 for Black — the first index of history.
+func sideIndex(b *dragontoothmg.Board) int {
+	if b.Wtomove {
+		return 0
+	}
+	return 1
+}
+
+// isQuiet reports whether m is neither a capture nor a promotion.
+func isQuiet(b *dragontoothmg.Board, m dragontoothmg.Move) bool {
+	return m.Promote() == dragontoothmg.Nothing && !dragontoothmg.IsCapture(m, b)
+}
+
+// hasNonPawnMaterial reports whether the side to move has a piece other than
+// pawns and the king — the precondition that makes null-move pruning safe.
+func hasNonPawnMaterial(b *dragontoothmg.Board) bool {
+	side := &b.White
+	if !b.Wtomove {
+		side = &b.Black
+	}
+	return side.Knights|side.Bishops|side.Rooks|side.Queens != 0
+}
+
+// nullMoveBoard returns b with the side to move flipped and any en-passant right
+// dropped — the position reached by "passing". It goes through FEN because
+// dragontoothmg keeps the Zobrist hash and en-passant square in unexported
+// fields, and a stale hash would corrupt the shared transposition table.
+func nullMoveBoard(b *dragontoothmg.Board) dragontoothmg.Board {
+	f := strings.Fields(b.ToFen())
+	if f[1] == "w" {
+		f[1] = "b"
+	} else {
+		f[1] = "w"
+	}
+	f[3] = "-"
+	return dragontoothmg.ParseFen(strings.Join(f, " "))
+}
+
 // orderMoves sorts moves best-first so alpha-beta prunes as early as possible:
-// the transposition-table move first, then promotions, then captures by MVV-LVA
-// (most valuable victim, least valuable attacker), then quiet moves.
-func orderMoves(b *dragontoothmg.Board, moves []dragontoothmg.Move, ttMove dragontoothmg.Move) []dragontoothmg.Move {
+// the transposition-table move, then promotions, then captures by MVV-LVA (most
+// valuable victim, least valuable attacker), then the two killer moves for this
+// ply, then the remaining quiet moves by history score.
+func (s *searcher) orderMoves(b *dragontoothmg.Board, moves []dragontoothmg.Move, ttMove dragontoothmg.Move, ply int) []dragontoothmg.Move {
+	var k0, k1 dragontoothmg.Move
+	if ply >= 0 && ply <= maxPly {
+		k0, k1 = s.killers[ply][0], s.killers[ply][1]
+	}
+	side := sideIndex(b)
+
 	type scored struct {
 		move  dragontoothmg.Move
 		score int
@@ -328,18 +489,26 @@ func orderMoves(b *dragontoothmg.Board, moves []dragontoothmg.Move, ttMove drago
 	list := make([]scored, len(moves))
 	for i := range moves {
 		m := moves[i]
-		sc := 0
-		if ttMove != 0 && m == ttMove {
-			sc = 1 << 20
-		} else {
-			if p := m.Promote(); p != dragontoothmg.Nothing {
-				sc += 90000 + pieceValue[p]
-			}
+		var sc int
+		switch {
+		case ttMove != 0 && m == ttMove:
+			sc = 1 << 24
+		case m.Promote() != dragontoothmg.Nothing:
+			sc = 1<<20 + pieceValue[m.Promote()]
 			if dragontoothmg.IsCapture(m, b) {
 				victim, _ := dragontoothmg.GetPieceType(m.To(), b)
-				attacker, _ := dragontoothmg.GetPieceType(m.From(), b)
-				sc += 10000 + pieceValue[victim]*8 - pieceValue[attacker]
+				sc += pieceValue[victim]
 			}
+		case dragontoothmg.IsCapture(m, b):
+			victim, _ := dragontoothmg.GetPieceType(m.To(), b)
+			attacker, _ := dragontoothmg.GetPieceType(m.From(), b)
+			sc = 1<<19 + pieceValue[victim]*8 - pieceValue[attacker]
+		case m == k0:
+			sc = 1<<18 + 1
+		case m == k1:
+			sc = 1 << 18
+		default:
+			sc = s.history[side][m.From()][m.To()]
 		}
 		list[i] = scored{m, sc}
 	}

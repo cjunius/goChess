@@ -42,7 +42,13 @@ unapply closure), FEN parsing, an incrementally-updated Zobrist hash
   deepening around a negamax alpha-beta core, with:
   - quiescence search at the horizon (captures and promotions only),
   - transposition-table probes/stores with hash-move ordering,
-  - MVV-LVA move ordering,
+  - move ordering: TT move, promotions, MVV-LVA captures, two killer moves
+    per ply, then quiet moves by a `[side][from][to]` history score,
+  - null-move pruning (skipped in check, at shallow depth, with only pawns
+    left, or right after another null move; the pass board is built through
+    FEN so the shared TT never sees a stale hash),
+  - late move reductions — late quiet moves are searched a ply or two
+    shallower and re-searched at full depth only if they beat alpha,
   - mate-distance-aware scoring (`mateScore - ply`), ply-rebased through the TT,
   - Lazy SMP: `SearchParams.Threads` workers deepen independently on their own
     board copy over one shared TT; the deepest completed result wins,
@@ -65,8 +71,8 @@ Search is synchronous, so `stop` is a no-op and `bestmove` is emitted as soon as
 
 ## Deliberately not here yet
 
-Killer/history heuristics, null-move pruning, LMR, aspiration windows, opening
-book, tablebases, pondering, `SearchMoves`/`MultiPV`.
+Aspiration windows, principal variation search, static exchange evaluation,
+search extensions, opening book, tablebases, pondering, `SearchMoves`/`MultiPV`.
 
 ## Key invariants
 
