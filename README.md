@@ -17,10 +17,11 @@ Early. The engine plays legal chess via a UCI loop with:
 - **Move generation** — delegated to `dragontoothmg` (verified with perft).
 - **Evaluation** — material + piece-square tables + bishop pair.
 - **Search** — iterative deepening, negamax alpha-beta, quiescence search,
-  MVV-LVA move ordering, hard time limits.
+  MVV-LVA move ordering, a shared transposition table with hash-move ordering,
+  Lazy SMP (multi-threaded search), hard time limits.
 
-Not yet implemented: transposition table, killer/history heuristics, null-move
-pruning, opening book, endgame tablebases. See the [roadmap](#roadmap).
+Not yet implemented: killer/history heuristics, null-move pruning, opening book,
+endgame tablebases. See the [roadmap](#roadmap).
 
 ## Install
 
@@ -51,9 +52,18 @@ gochess version
 Add the binary as an engine in any UCI GUI, or pipe commands directly:
 
 ```
+setoption name Hash value 128
+setoption name Threads value 8
 position startpos moves e2e4 e7e5
 go movetime 1000
 ```
+
+### UCI options
+
+| Option | Default | Range | Meaning |
+|---|---|---|---|
+| `Hash` | 64 | 1–4096 | Transposition-table size in MiB. |
+| `Threads` | 1 | 1–256 | Lazy-SMP worker count (capped at the machine's core count at search time). |
 
 ## Development
 
@@ -82,7 +92,8 @@ docs/              architecture notes and ADRs
 - [x] Negamax + alpha-beta + iterative deepening + time budget
 - [x] UCI loop
 - [x] Quiescence search + MVV-LVA move ordering
-- [ ] Transposition table (Zobrist hash is already available from `dragontoothmg`)
+- [x] Transposition table (Zobrist hash from `dragontoothmg`) + hash-move ordering
+- [x] Lazy SMP — multi-threaded search over the shared TT (`Threads` UCI option)
 - [ ] Killer moves + history heuristic
 - [ ] Null-move pruning, late move reductions
 - [ ] Opening book (Polyglot) and Syzygy tablebase probing

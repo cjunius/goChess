@@ -41,23 +41,32 @@ unapply closure), FEN parsing, an incrementally-updated Zobrist hash
 - **search.go** — `Search(*Board, SearchParams) SearchResult`. Iterative
   deepening around a negamax alpha-beta core, with:
   - quiescence search at the horizon (captures and promotions only),
+  - transposition-table probes/stores with hash-move ordering,
   - MVV-LVA move ordering,
-  - mate-distance-aware scoring (`mateScore - ply`),
+  - mate-distance-aware scoring (`mateScore - ply`), ply-rebased through the TT,
+  - Lazy SMP: `SearchParams.Threads` workers deepen independently on their own
+    board copy over one shared TT; the deepest completed result wins,
   - a hard wall-clock budget checked every 2048 nodes; the last fully completed
     depth is returned.
+- **transposition.go** — `TT`, a fixed-size power-of-two table keyed by
+  `Board.Hash`. Each 16-byte slot is a pair of `atomic.Uint64` words accessed
+  with Hyatt's lockless XOR trick (`word0 = key ^ data`), so the Lazy-SMP
+  workers share it without a mutex; a write torn across goroutines reads as a
+  miss. `data` packs move, int32 score, depth and bound flag.
 
 ### `internal/uci`
 
-A line-oriented reader for `uci`, `isready`, `ucinewgame`, `position`
-(`startpos` / `fen`, with `moves`), `go` (`depth`, `movetime`, `wtime`/`btime`),
-`stop`, `d`, and `quit`. Search is synchronous, so `stop` is a no-op and
-`bestmove` is emitted as soon as `go` returns.
+A line-oriented reader for `uci`, `isready`, `setoption`, `ucinewgame`,
+`position` (`startpos` / `fen`, with `moves`), `go` (`depth`, `movetime`,
+`wtime`/`btime`), `stop`, `d`, and `quit`. It owns the persistent `engine.TT`
+(sized by the `Hash` option, cleared on `ucinewgame`) and the `Threads` setting.
+Search is synchronous, so `stop` is a no-op and `bestmove` is emitted as soon as
+`go` returns.
 
 ## Deliberately not here yet
 
-Transposition table, killer/history heuristics, null-move pruning, LMR, aspiration
-windows, opening book, tablebases, pondering, `SearchMoves`/`MultiPV`. The Zobrist
-hash needed for a TT is already exposed by `dragontoothmg`.
+Killer/history heuristics, null-move pruning, LMR, aspiration windows, opening
+book, tablebases, pondering, `SearchMoves`/`MultiPV`.
 
 ## Key invariants
 
@@ -68,3 +77,6 @@ hash needed for a TT is already exposed by `dragontoothmg`.
 3. **Evaluation sign convention**: positive = good for the side to move.
 4. **Untrusted input**: FEN and UCI strings come from GUIs and tournament
    managers. Parsing must not panic (see SECURITY.md).
+5. **The TT is the only shared mutable state between Lazy-SMP workers.** Every
+   worker has its own `dragontoothmg.Board` copy and its own `searcher`; the
+   table is safe for concurrent use, so no other synchronisation is needed.

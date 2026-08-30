@@ -28,17 +28,25 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
   bishop-pair bonus. Crude, but it captures development, central control, king
   placement and the two-bishop advantage.
 - **Compiled and fast** — ~2.7M nodes/sec in a single thread on an Apple M4
-  (`gochess bench`). That is ~50–60× the node rate of a typical Python engine,
-  so effective search depth is respectable even without a transposition table.
+  (`gochess bench`), and Lazy SMP puts the other cores to work. That is ~50–60×
+  the node rate of a typical Python engine, so effective search depth is
+  respectable.
 - **Robust I/O** — FEN and UCI parsing is fuzz-safe and non-panicking; the
   engine will not forfeit on a malformed GUI command.
 
+### Recently added
+
+- **Transposition table + hash-move ordering.** A shared, lock-free table keyed
+  by the `dragontoothmg` Zobrist hash now caches EXACT / LOWER / UPPER bounds
+  and the best move (mate scores rebased by ply). It roughly cuts the node count
+  of a depth-7 search from the opening by ~7× and seeds move ordering with the
+  hash move.
+- **Lazy SMP.** `Threads` workers deepen in parallel on private board copies
+  over the one shared table. With 4–8 cores this reaches a given depth several
+  times faster than the single-threaded search did.
+
 ### Limiting factors
 
-- **No transposition table.** The Zobrist hash is already exposed by
-  `dragontoothmg`, but nothing caches search results yet. Transpositions are
-  re-searched from scratch, and there is no hash move to seed move ordering.
-  This is the single largest missing feature — worth an estimated 150–250 Elo.
 - **No killer or history heuristic.** Quiet-move ordering is essentially
   arbitrary, so cut-offs deep in the tree are later than they should be.
 - **No null-move pruning, no late move reductions, no futility or delta
@@ -55,8 +63,9 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
 - **Thin endgame play.** No tablebase probing, no KPK / KBNK knowledge, no
   contempt. The 50-move rule is honoured but threefold repetition is not
   detected inside the search.
-- **Single-threaded.** No Lazy SMP or any other parallel search; the other
-  nine cores of the test machine sit idle.
+- **Basic Lazy SMP only.** Workers share the TT and start at staggered depths,
+  but there is no root-move splitting, aspiration-window skew, or TT ageing, so
+  parallel scaling past a handful of threads is modest.
 - **Synchronous search.** `stop` is a no-op and there is no pondering, so the
   engine cannot think on the opponent's clock or bail out of a bad time
   allocation.
@@ -65,7 +74,7 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
 
 | Reference engine | ~CCRL blitz | Relevant comparison |
 | ---------------- | ----------- | ------------------- |
-| TSCP 1.81 | ~1700 | Similar search shape (alpha-beta, iterative deepening, quiescence, MVV-LVA) **plus** a transposition table. goChess should land at or just below TSCP until the TT lands. |
+| TSCP 1.81 | ~1700 | Similar search shape (alpha-beta, iterative deepening, quiescence, MVV-LVA, transposition table). goChess should now land near TSCP, with the missing pruning heuristics still costing rating. |
 | Sungorus 1.4 | ~2000 | TT + null-move + PVS + killers. Clearly stronger than goChess today. |
 | CT800 / Claudia class | ~2100+ | Full modern pruning set. Out of reach without the roadmap features. |
 
@@ -84,30 +93,30 @@ depth is unusually shallow for its speed — each extra ply is high-value.
 | Bullet (1+0) | ~1350–1550 | Depth 4–6; positional weaknesses dominate. |
 | Blitz (3+2 / 5+0) | ~1500–1750 | Depth 6–9; the headline estimate. |
 | Rapid (15+10) | ~1650–1900 | Depth 9–12; tactics get sharper, eval ceiling starts to bite. |
-| Classical (40/40) | ~1750–2000 | Depth-limited by the missing TT more than by the clock. |
+| Classical (40/40) | ~1750–2000 | Depth-limited by the missing pruning heuristics more than by the clock. |
 
 ## Where the number would move
 
 Rough, independent Elo deltas from the [roadmap](../README.md#roadmap),
 assuming each is implemented competently and validated by SPRT:
 
-| Change | Estimated Elo |
-| ------ | ------------- |
-| Transposition table + hash-move ordering | +150 to +250 |
-| Killer moves + history heuristic | +50 to +100 |
-| Null-move pruning | +50 to +80 |
-| Late move reductions | +50 to +100 |
-| Aspiration windows | +10 to +30 |
-| Game-phase eval interpolation (tapered eval) | +30 to +60 |
-| Passed pawns / king safety / mobility terms | +40 to +80 |
-| Texel-tuned evaluation weights | +40 to +80 |
-| Opening book (Polyglot) | +20 to +40 at short TC |
-| Syzygy tablebase probing | +10 to +20 |
-| Lazy SMP (8 threads) | +100 to +150 |
+| Change | Estimated Elo | Status |
+| ------ | ------------- | ------ |
+| Transposition table + hash-move ordering | +150 to +250 | done, pending SPRT |
+| Lazy SMP (8 threads) | +100 to +150 | done (basic), pending SPRT |
+| Killer moves + history heuristic | +50 to +100 | |
+| Null-move pruning | +50 to +80 | |
+| Late move reductions | +50 to +100 | |
+| Aspiration windows | +10 to +30 | |
+| Game-phase eval interpolation (tapered eval) | +30 to +60 | |
+| Passed pawns / king safety / mobility terms | +40 to +80 | |
+| Texel-tuned evaluation weights | +40 to +80 | |
+| Opening book (Polyglot) | +20 to +40 at short TC | |
+| Syzygy tablebase probing | +10 to +20 | |
 
-Landing the transposition table, killers/history, null-move and LMR together
-would plausibly put goChess in the 1950–2150 range; adding tapered/tuned eval
-and Lazy SMP on top targets 2300+.
+With the transposition table and Lazy SMP in, adding killers/history, null-move
+and LMR would plausibly put goChess in the 1950–2150 range; tapered/tuned eval
+on top targets 2300+.
 
 ## Measuring it properly
 

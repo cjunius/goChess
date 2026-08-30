@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,17 +24,31 @@ const (
 	// Fraction of the remaining clock to spend on one move when the GUI sends
 	// wtime/btime rather than an explicit movetime.
 	clockDivisor = 30
+
+	defaultHashMB  = 64
+	minHashMB      = 1
+	maxHashMB      = 4096
+	maxThreads     = 256
+	defaultThreads = 1
 )
 
 type session struct {
-	board dragontoothmg.Board
-	out   io.Writer
+	board   dragontoothmg.Board
+	out     io.Writer
+	tt      *engine.TT
+	hashMB  int
+	threads int
 }
 
 // Run reads UCI commands from r and writes responses to w until "quit" or EOF.
 // version is reported in the "id name" line.
 func Run(r io.Reader, w io.Writer, version string) error {
-	s := &session{board: dragontoothmg.ParseFen(dragontoothmg.Startpos), out: w}
+	s := &session{
+		board:   dragontoothmg.ParseFen(dragontoothmg.Startpos),
+		out:     w,
+		hashMB:  defaultHashMB,
+		threads: defaultThreads,
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -46,11 +61,19 @@ func Run(r io.Reader, w io.Writer, version string) error {
 		case "uci":
 			fmt.Fprintf(w, "id name %s %s\n", engineName, version)
 			fmt.Fprintf(w, "id author %s\n", engineAuthor)
+			fmt.Fprintf(w, "option name Hash type spin default %d min %d max %d\n", defaultHashMB, minHashMB, maxHashMB)
+			fmt.Fprintf(w, "option name Threads type spin default %d min 1 max %d\n", defaultThreads, maxThreads)
 			fmt.Fprintln(w, "uciok")
 		case "isready":
+			s.ensureTT()
 			fmt.Fprintln(w, "readyok")
+		case "setoption":
+			s.handleSetOption(fields[1:])
 		case "ucinewgame":
 			s.board = dragontoothmg.ParseFen(dragontoothmg.Startpos)
+			if s.tt != nil {
+				s.tt.Clear()
+			}
 		case "position":
 			s.handlePosition(fields[1:])
 		case "go":
@@ -64,6 +87,56 @@ func Run(r io.Reader, w io.Writer, version string) error {
 		}
 	}
 	return sc.Err()
+}
+
+// ensureTT lazily allocates the transposition table at the configured size.
+func (s *session) ensureTT() {
+	if s.tt == nil {
+		s.tt = engine.NewTT(s.hashMB)
+	}
+}
+
+// handleSetOption parses "setoption name <Name> value <Value>" for the options
+// advertised in the "uci" reply. Unknown options are ignored, as the protocol
+// requires.
+func (s *session) handleSetOption(args []string) {
+	var name, value string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "name":
+			j := i + 1
+			for j < len(args) && args[j] != "value" {
+				j++
+			}
+			name = strings.Join(args[i+1:j], " ")
+			i = j - 1
+		case "value":
+			value = strings.Join(args[i+1:], " ")
+			i = len(args)
+		}
+	}
+
+	switch strings.ToLower(name) {
+	case "hash":
+		if n, err := strconv.Atoi(value); err == nil {
+			s.hashMB = clamp(n, minHashMB, maxHashMB)
+			s.tt = engine.NewTT(s.hashMB) // resize now, before the next search
+		}
+	case "threads":
+		if n, err := strconv.Atoi(value); err == nil {
+			s.threads = clamp(n, 1, maxThreads)
+		}
+	}
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func (s *session) handlePosition(args []string) {
@@ -127,6 +200,13 @@ func (s *session) handleGo(args []string) {
 		}
 	}
 	params.MoveTime = movetime
+
+	s.ensureTT()
+	params.TT = s.tt
+	params.Threads = s.threads
+	if n := runtime.NumCPU(); params.Threads > n {
+		params.Threads = n // never spawn more workers than the machine has cores
+	}
 
 	res := engine.Search(&s.board, params)
 	if res.Depth > 0 {

@@ -1,34 +1,56 @@
 # Performance
 
-Fresh benchmark of the current engine (iterative deepening, negamax alpha-beta,
-bounded quiescence, MVV-LVA move ordering, hard time limit; **no** transposition
-table, killers/history, null-move pruning, or LMR yet) on one machine: Apple M4,
-10 cores, Go 1.27, `darwin/arm64`. Search is from the starting position; rows
-stop once a search passes ~5 seconds. "Nodes" is the engine's node counter
-(`negamax` + `quiesce` calls). Numbers are single-run and rounded — the search
-is single-threaded and deterministic, so node counts repeat exactly and only the
-wall-clock wobbles.
+Benchmark of the current engine (iterative deepening, negamax alpha-beta,
+bounded quiescence, MVV-LVA move ordering, a shared transposition table, Lazy
+SMP, hard time limit; **no** killers/history, null-move pruning, or LMR yet) on
+one machine: Apple M4, 10 cores, Go 1.27, `darwin/arm64`. Search is from the
+starting position unless noted. "Nodes" is the engine's node counter (`negamax`
++ `quiesce` calls). Numbers are single-run and rounded; with a shared TT and
+multiple workers the search is no longer bit-for-bit deterministic, so node
+counts wobble a few percent between runs.
 
-## What `go` / `go depth N` runs today: single-process iterative deepening
+## What `go` / `go depth N` runs today: iterative deepening + TT (+ optional Lazy SMP)
 
-This is the real search path. There is no Lazy SMP or parallel search — `go`
-runs one `Search` on one goroutine, deepening from depth 1 until it runs out of
-`movetime` (or hits `depth N`), and returns the last fully completed depth. The
-rows below use a generous budget so the run isn't deadline-capped.
+`go` deepens from depth 1 until it runs out of `movetime` (or hits `depth N`)
+and returns the last fully completed depth. Every `negamax` node probes and
+stores the shared transposition table, and the stored move seeds move ordering.
+With `Threads > 1` that same search runs on N goroutines over the one table
+(Lazy SMP).
 
-| depth | time | nodes | bestmove |
-|------:|-----:|------:|:---------|
-| 4 | 0.01s |     55,614 | b1c3 |
-| 5 | 0.06s |    457,203 | d2d4 |
-| 6 | 0.45s |  3,097,162 | d2d4 |
-| 7 | 3.4s  | 23,615,017 | e2e4 |
-| 8 | 30s   | 160,689,328 | d2d4 |
+Single-threaded, `Hash 128`, generous budget so the run isn't deadline-capped.
+"Before TT" is the pre-transposition-table baseline from earlier revisions of
+this document:
 
-(Cumulative nodes over the deepening series 1..N; the shallower iterations add
-well under 1%.) Depth 7 from the opening lands in ~3s on this machine, depth 8 in
-~30s. Adding a transposition table is the single biggest lever left — it would
-recover most of the redundant re-search between iterations and across
-transposing lines.
+| depth | time (before TT) | nodes (before TT) | time (with TT) | nodes (with TT) |
+|------:|-----------------:|------------------:|---------------:|----------------:|
+| 6 | 0.45s |   3,097,162 | 0.09s | ~0.6M |
+| 7 | 3.4s  |  23,615,017 | 0.52s | ~3.1M |
+| 8 | 30s   | 160,689,328 | 1.3s  | ~5.9M |
+
+The transposition table is the single biggest lever in the engine's history —
+it recovers most of the redundant re-search between iterations and across
+transposing lines, and cuts depth-8-from-the-opening from ~30s to ~1.3s.
+
+## Lazy SMP scaling
+
+Basic Lazy SMP: workers share the TT and start at staggered depths, but there is
+no root-move splitting or aspiration-window skew yet, so on TT-friendly
+positions the workers largely re-explore the same tree. Fixed-depth wall-clock
+is roughly flat; the value shows up as extra breadth (each worker's TT-perturbed
+ordering occasionally finds a better line) and robustness on tactical positions,
+plus headroom once root splitting lands. Approximate, `movetime 2000` from the
+start position:
+
+| threads | depth reached | nodes |
+|--------:|--------------:|------:|
+| 1 | 8 |  ~9.1M |
+| 2 | 8 | ~17.8M |
+| 4 | 8 | ~32.1M |
+| 8 | 8 | ~42.6M |
+
+Nodes scale with worker count (overlapping work); turning that into deeper
+fixed-time search is what per-worker root-move splitting on the
+[roadmap](../README.md#roadmap) is for.
 
 ## Move generation: `perft` from the start position
 
@@ -48,9 +70,15 @@ Move generation is delegated to `dragontoothmg` and is not the bottleneck.
 ## Single fixed-depth search from the start position
 
 A controlled baseline: one search to exactly depth `N` (no iterative deepening),
-clock never armed. Deterministic, and it isolates search-tree efficiency, so
-this is the table to watch when judging whether a search change helped. Not what
-the engine runs in a game.
+clock never armed. It isolates search-tree efficiency, so this is the table to
+watch when judging whether a search change helped. Not what the engine runs in a
+game.
+
+> **Stale since the TT landed.** The table below predates the transposition
+> table. `Search` now always uses a TT (a private one when the caller passes
+> none), so a single fixed-depth search from a cold table already benefits from
+> intra-search transpositions — the real node counts are lower than shown and
+> vary slightly run to run. Regenerate this table with a fresh benchmark.
 
 The `perft(depth)` column is the size of the *full* legal game tree at that
 depth — the branching the search would face with no alpha-beta at all. `pruned`
