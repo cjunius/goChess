@@ -17,11 +17,12 @@ Early. The engine plays legal chess via a UCI loop with:
 - **Move generation** — delegated to `dragontoothmg` (verified with perft).
 - **Evaluation** — material + piece-square tables + bishop pair.
 - **Search** — iterative deepening, negamax alpha-beta, quiescence search,
-  MVV-LVA move ordering, a shared transposition table with hash-move ordering,
-  Lazy SMP (multi-threaded search), hard time limits.
+  a shared transposition table with hash-move ordering, MVV-LVA + killer-move +
+  history move ordering, null-move pruning, late move reductions, Lazy SMP
+  (multi-threaded search), hard time limits.
 
-Not yet implemented: killer/history heuristics, null-move pruning, opening book,
-endgame tablebases. See the [roadmap](#roadmap).
+Not yet implemented: aspiration windows / PVS, opening book, endgame tablebases.
+See the [roadmap](#roadmap).
 
 ## Install
 
@@ -94,8 +95,9 @@ docs/              architecture notes and ADRs
 - [x] Quiescence search + MVV-LVA move ordering
 - [x] Transposition table (Zobrist hash from `dragontoothmg`) + hash-move ordering
 - [x] Lazy SMP — multi-threaded search over the shared TT (`Threads` UCI option)
-- [ ] Killer moves + history heuristic
-- [ ] Null-move pruning, late move reductions
+- [x] Killer moves + history heuristic
+- [x] Null-move pruning + late move reductions
+- [ ] Aspiration windows / principal variation search
 - [ ] Opening book (Polyglot) and Syzygy tablebase probing
 - [ ] Strength testing harness (SPRT via cutechess-cli)
 

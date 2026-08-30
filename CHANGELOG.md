@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `internal/engine`: perft (with start-position and Kiwipete regression tests),
   static evaluation (material + piece-square tables + bishop pair), and an
   iterative-deepening negamax alpha-beta search with quiescence search,
-  MVV-LVA move ordering, and a hard time budget.
+  a shared lock-free transposition table, Lazy SMP, and a hard time budget.
+- `internal/engine`: search heuristics — killer moves + a `[side][from][to]`
+  history table in move ordering, null-move pruning, and late move reductions.
 - `internal/uci`: a UCI protocol loop (`uci`, `isready`, `ucinewgame`,
   `position`, `go`, `stop`, `quit`) supporting `go depth`, `go movetime`, and
   `go wtime/btime`.

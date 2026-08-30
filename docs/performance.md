@@ -1,55 +1,67 @@
 # Performance
 
 Benchmark of the current engine (iterative deepening, negamax alpha-beta,
-bounded quiescence, MVV-LVA move ordering, a shared transposition table, Lazy
-SMP, hard time limit; **no** killers/history, null-move pruning, or LMR yet) on
-one machine: Apple M4, 10 cores, Go 1.27, `darwin/arm64`. Search is from the
-starting position unless noted. "Nodes" is the engine's node counter (`negamax`
-+ `quiesce` calls). Numbers are single-run and rounded; with a shared TT and
-multiple workers the search is no longer bit-for-bit deterministic, so node
-counts wobble a few percent between runs.
+bounded quiescence, a shared transposition table, MVV-LVA + killer + history
+move ordering, null-move pruning, late move reductions, Lazy SMP, hard time
+limit) on one machine: Apple M4, 10 cores, Go 1.27, `darwin/arm64`. Search is
+from the starting position unless noted. "Nodes" is the engine's node counter
+(`negamax` + `quiesce` calls). Numbers are single-run and rounded; with a shared
+TT and multiple workers the search is no longer bit-for-bit deterministic, so
+node counts wobble a few percent between runs.
 
-## What `go` / `go depth N` runs today: iterative deepening + TT (+ optional Lazy SMP)
+## What `go` / `go depth N` runs today
 
 `go` deepens from depth 1 until it runs out of `movetime` (or hits `depth N`)
 and returns the last fully completed depth. Every `negamax` node probes and
-stores the shared transposition table, and the stored move seeds move ordering.
-With `Threads > 1` that same search runs on N goroutines over the one table
-(Lazy SMP).
+stores the shared transposition table; move ordering is TT move → promotions →
+MVV-LVA captures → killer moves → history; interior nodes try a null move first
+and reduce late quiet moves. With `Threads > 1` that same search runs on N
+goroutines over the one table (Lazy SMP).
 
 Single-threaded, `Hash 128`, generous budget so the run isn't deadline-capped.
-"Before TT" is the pre-transposition-table baseline from earlier revisions of
-this document:
+The two earlier columns are from previous revisions of this document: "before
+TT" is plain alpha-beta + quiescence, "TT only" adds the transposition table but
+none of the ordering/pruning heuristics below.
 
-| depth | time (before TT) | nodes (before TT) | time (with TT) | nodes (with TT) |
-|------:|-----------------:|------------------:|---------------:|----------------:|
-| 6 | 0.45s |   3,097,162 | 0.09s | ~0.6M |
-| 7 | 3.4s  |  23,615,017 | 0.52s | ~3.1M |
-| 8 | 30s   | 160,689,328 | 1.3s  | ~5.9M |
+| depth | nodes (before TT) | nodes (TT only) | time (now) | nodes (now) |
+|------:|------------------:|----------------:|-----------:|------------:|
+|  6 |   3,097,162 | ~0.6M | 0.02s |    33,000 |
+|  7 |  23,615,017 | ~3.1M | 0.02s |    40,000 |
+|  8 | 160,689,328 | ~5.9M | 0.07s |   167,000 |
+|  9 |           — |     — | 0.15s |   364,000 |
+| 10 |           — |     — | 0.23s |   548,000 |
+| 11 |           — |     — | 0.67s | 1,426,000 |
+| 12 |           — |     — | 1.13s | 2,285,000 |
 
-The transposition table is the single biggest lever in the engine's history —
-it recovers most of the redundant re-search between iterations and across
-transposing lines, and cuts depth-8-from-the-opening from ~30s to ~1.3s.
+Killers/history + null-move pruning + LMR are the second big lever after the TT:
+a depth-8 search from the opening drops from ~5.9M nodes to ~167k (~35×), and the
+engine now reaches depth 12 in about the wall-clock time depth 8 used to take.
+Node rate is roughly unchanged at ~2.5M nps (`gochess bench`) — each node costs
+a little more now (a static eval and a check test per interior node, plus a
+FEN round-trip per null move) but there are far fewer of them.
+
+The effective branching factor across the deeper rows is ~1.8 (√ of the
+node-count ratio between adjacent depths), versus ~7 for TT-only alpha-beta and
+√35 ≈ 5.9 for the theoretical alpha-beta minimum — reductions and null-move
+pruning search a tree much narrower than full-width minimax.
 
 ## Lazy SMP scaling
 
 Basic Lazy SMP: workers share the TT and start at staggered depths, but there is
 no root-move splitting or aspiration-window skew yet, so on TT-friendly
-positions the workers largely re-explore the same tree. Fixed-depth wall-clock
-is roughly flat; the value shows up as extra breadth (each worker's TT-perturbed
-ordering occasionally finds a better line) and robustness on tactical positions,
-plus headroom once root splitting lands. Approximate, `movetime 2000` from the
-start position:
+positions the workers largely re-explore the same tree. The value shows up as
+extra breadth and tactical robustness, and as a modest depth gain at fixed time.
+Approximate, `movetime 2000` from the start position:
 
 | threads | depth reached | nodes |
 |--------:|--------------:|------:|
-| 1 | 8 |  ~9.1M |
-| 2 | 8 | ~17.8M |
-| 4 | 8 | ~32.1M |
-| 8 | 8 | ~42.6M |
+| 1 | 13 |  ~3.8M |
+| 2 | 13 |  ~7.9M |
+| 4 | 14 | ~14.4M |
+| 8 | 14 | ~20.2M |
 
-Nodes scale with worker count (overlapping work); turning that into deeper
-fixed-time search is what per-worker root-move splitting on the
+Nodes scale with worker count (overlapping work); turning that into consistently
+deeper fixed-time search is what per-worker root-move splitting on the
 [roadmap](../README.md#roadmap) is for.
 
 ## Move generation: `perft` from the start position
@@ -67,43 +79,15 @@ Move generation is delegated to `dragontoothmg` and is not the bottleneck.
 ~160–170M nodes/sec at the deeper counts, all of which match the published
 [perft results](https://www.chessprogramming.org/Perft_Results).
 
-## Single fixed-depth search from the start position
+## Regenerating these numbers
 
-A controlled baseline: one search to exactly depth `N` (no iterative deepening),
-clock never armed. It isolates search-tree efficiency, so this is the table to
-watch when judging whether a search change helped. Not what the engine runs in a
-game.
+```bash
+gochess bench                     # 4-position fixed-depth-6 node/nps summary
+gochess perft 6                   # timed perft series
+```
 
-> **Stale since the TT landed.** The table below predates the transposition
-> table. `Search` now always uses a TT (a private one when the caller passes
-> none), so a single fixed-depth search from a cold table already benefits from
-> intra-search transpositions — the real node counts are lower than shown and
-> vary slightly run to run. Regenerate this table with a fresh benchmark.
-
-The `perft(depth)` column is the size of the *full* legal game tree at that
-depth — the branching the search would face with no alpha-beta at all. `pruned`
-is `1 - nodes/perft`.
-
-| depth | time | nodes | perft(depth) | pruned |
-|------:|-----:|------:|-------------:|-------:|
-| 2 | 0.000s |         452 |            400 |     −13% |
-| 3 | 0.002s |       5,318 |          8,902 |      40% |
-| 4 | 0.011s |      49,804 |        197,281 |      75% |
-| 5 | 0.056s |     401,589 |      4,865,609 |    91.8% |
-| 6 | 0.40s  |   2,639,959 |    119,060,324 |    97.8% |
-| 7 | 2.9s   |  20,517,855 |  3,195,901,860 |    99.4% |
-| 8 | 27s    | 137,074,311 | 84,998,978,956 |   99.84% |
-
-The `pruned` column is an *estimate*: the two counts aren't the same unit.
-"nodes" counts every node the search visits (internal nodes and quiescence
-included, and quiescence looks past `depth` in forcing lines); `perft` is only
-the leaves at exactly `depth`. At depth 2 the search actually expands *more*
-nodes than the full tree — quiescence chases every capture sequence to its end
-and there is no TT to catch repeats — so `pruned` goes negative. From depth 4 on
-the trend is real: MVV-LVA ordering plus alpha-beta take the tree from "search
-all of it" to "search one node in ~620" by depth 8.
-
-The effective branching factor across the deeper rows is roughly 7 (≈√35, the
-alpha-beta ideal for a ~35-move position would be ~6). Closing that last gap —
-and cutting the constant factor — is what the transposition table, killer moves,
-and null-move pruning on the [roadmap](../README.md#roadmap) are for.
+The per-depth tables above come from a short throwaway test that calls
+`engine.Search` with `SearchParams{MaxDepth: d, TT: engine.NewTT(128)}` for each
+depth and prints `res.Elapsed` / `res.Nodes`. Re-run it after any search change
+and update the "nodes (now)" column; a regression there is the first sign a
+heuristic is mis-tuned.

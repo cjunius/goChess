@@ -1,6 +1,6 @@
 # Engine Strength
 
-**Estimated playing strength: ~1500–1750 Elo (likely ~1600) on the CCRL blitz
+**Estimated playing strength: ~1900–2150 Elo (likely ~2000) on the CCRL blitz
 scale.**
 
 This is a reasoned estimate from the feature set and search speed, **not a
@@ -21,16 +21,18 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
 - **Quiescence search** at the horizon (captures and promotions only), so the
   static evaluation is never taken in the middle of a capture sequence — this
   alone removes most one-move blunders.
-- **Move ordering** — promotions first, then captures by MVV-LVA (most valuable
-  victim, least valuable attacker), then quiet moves. Good ordering is what
-  makes alpha-beta actually prune.
+- **Move ordering** — hash move, then promotions, then captures by MVV-LVA (most
+  valuable victim, least valuable attacker), then the two killer moves for the
+  ply, then quiet moves by history score. Good ordering is what makes alpha-beta
+  actually prune, and it is also what makes null-move pruning and LMR safe.
 - **Evaluation** — material values + Michniewski piece-square tables + a
   bishop-pair bonus. Crude, but it captures development, central control, king
   placement and the two-bishop advantage.
-- **Compiled and fast** — ~2.7M nodes/sec in a single thread on an Apple M4
+- **Compiled and fast** — ~2.5M nodes/sec in a single thread on an Apple M4
   (`gochess bench`), and Lazy SMP puts the other cores to work. That is ~50–60×
   the node rate of a typical Python engine, so effective search depth is
-  respectable.
+  respectable — and with reductions and null-move pruning narrowing the tree,
+  the single-threaded search now reaches depth 12 from the opening in ~1s.
 - **Robust I/O** — FEN and UCI parsing is fuzz-safe and non-panicking; the
   engine will not forfeit on a malformed GUI command.
 
@@ -44,16 +46,25 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
 - **Lazy SMP.** `Threads` workers deepen in parallel on private board copies
   over the one shared table. With 4–8 cores this reaches a given depth several
   times faster than the single-threaded search did.
+- **Killer moves + history heuristic.** Quiet moves that cause a beta cut-off
+  are tried first at sibling nodes (two killers per ply) and accumulate a
+  `depth²` bonus in a `[side][from][to]` history table that orders the rest.
+  Both tables are per-searcher, so Lazy-SMP workers stay independent.
+- **Null-move pruning** (`R = 2`, `3` from depth 6) with the standard guards
+  (not in check, depth ≥ 3, non-mate beta, non-pawn material, no consecutive
+  nulls).
+- **Late move reductions.** Late quiet moves are searched 1–2 ply shallower and
+  re-searched at full depth only when the reduced search beats alpha.
+
+Together these cut a depth-8 search from the opening from ~5.9M nodes to ~167k
+and let the single-threaded search reach depth 12 in roughly the time depth 8
+used to cost. See [performance.md](performance.md).
 
 ### Limiting factors
 
-- **No killer or history heuristic.** Quiet-move ordering is essentially
-  arbitrary, so cut-offs deep in the tree are later than they should be.
-- **No null-move pruning, no late move reductions, no futility or delta
-  pruning, no aspiration windows.** The tree is close to full-width
-  alpha-beta + quiescence. Effective middlegame depth is roughly 6–9 ply at
-  blitz time controls, where a pruning-heavy engine of the same speed would
-  reach 12–16.
+- **No aspiration windows or principal variation search.** Every move past the
+  first at a node is still searched with a full window (LMR aside), so the
+  alpha-beta tree is wider than a PVS engine's.
 - **No search extensions** (check extensions, singular extensions). Tactical
   lines that need one extra ply past the horizon are missed.
 - **Hand-set evaluation weights, never tuned.** No Texel tuning, no
@@ -74,26 +85,26 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
 
 | Reference engine | ~CCRL blitz | Relevant comparison |
 | ---------------- | ----------- | ------------------- |
-| TSCP 1.81 | ~1700 | Similar search shape (alpha-beta, iterative deepening, quiescence, MVV-LVA, transposition table). goChess should now land near TSCP, with the missing pruning heuristics still costing rating. |
-| Sungorus 1.4 | ~2000 | TT + null-move + PVS + killers. Clearly stronger than goChess today. |
-| CT800 / Claudia class | ~2100+ | Full modern pruning set. Out of reach without the roadmap features. |
+| TSCP 1.81 | ~1700 | Similar search shape but no null-move / LMR. goChess should now be clearly stronger. |
+| Sungorus 1.4 | ~2000 | TT + null-move + PVS + killers — the closest match to goChess's current feature set. goChess should land near here, held back by the cruder evaluation and the missing PVS. |
+| CT800 / Claudia class | ~2100+ | Full modern pruning set plus a tuned eval. Reachable once aspiration/PVS and a tapered, tuned evaluation land. |
 
-The feature set most closely resembles a "first working alpha-beta engine" —
-tactically sound at shallow depth, positionally simplistic, and losing rating to
-every missing pruning technique. The fast node rate keeps it from dropping into
-true beginner territory.
+The feature set now resembles a "complete first-generation pruning engine" —
+tactically sharp for its node rate, still positionally simplistic (one untuned
+PST set, no pawn-structure or king-safety terms), so the evaluation is the main
+thing left holding the rating down.
 
 ## Time-control sensitivity
 
-Deeper search helps goChess more than most engines, because without pruning its
-depth is unusually shallow for its speed — each extra ply is high-value.
+Deeper search still helps goChess more than most engines: the evaluation is the
+ceiling, so every extra ply that sharpens the tactics is high-value.
 
 | Time control | Estimated Elo | Notes |
 | ------------ | ------------- | ----- |
-| Bullet (1+0) | ~1350–1550 | Depth 4–6; positional weaknesses dominate. |
-| Blitz (3+2 / 5+0) | ~1500–1750 | Depth 6–9; the headline estimate. |
-| Rapid (15+10) | ~1650–1900 | Depth 9–12; tactics get sharper, eval ceiling starts to bite. |
-| Classical (40/40) | ~1750–2000 | Depth-limited by the missing pruning heuristics more than by the clock. |
+| Bullet (1+0) | ~1750–1950 | Depth 8–11; the crude eval costs the most here. |
+| Blitz (3+2 / 5+0) | ~1900–2150 | Depth 11–14; the headline estimate. |
+| Rapid (15+10) | ~2000–2250 | Depth 14–18; tactics rarely miss, eval ceiling bites. |
+| Classical (40/40) | ~2050–2300 | Eval-limited more than depth-limited. |
 
 ## Where the number would move
 
@@ -104,19 +115,19 @@ assuming each is implemented competently and validated by SPRT:
 | ------ | ------------- | ------ |
 | Transposition table + hash-move ordering | +150 to +250 | done, pending SPRT |
 | Lazy SMP (8 threads) | +100 to +150 | done (basic), pending SPRT |
-| Killer moves + history heuristic | +50 to +100 | |
-| Null-move pruning | +50 to +80 | |
-| Late move reductions | +50 to +100 | |
-| Aspiration windows | +10 to +30 | |
+| Killer moves + history heuristic | +50 to +100 | done, pending SPRT |
+| Null-move pruning | +50 to +80 | done, pending SPRT |
+| Late move reductions | +50 to +100 | done, pending SPRT |
+| Aspiration windows / PVS | +20 to +50 | |
 | Game-phase eval interpolation (tapered eval) | +30 to +60 | |
 | Passed pawns / king safety / mobility terms | +40 to +80 | |
 | Texel-tuned evaluation weights | +40 to +80 | |
 | Opening book (Polyglot) | +20 to +40 at short TC | |
 | Syzygy tablebase probing | +10 to +20 | |
 
-With the transposition table and Lazy SMP in, adding killers/history, null-move
-and LMR would plausibly put goChess in the 1950–2150 range; tapered/tuned eval
-on top targets 2300+.
+With the TT, Lazy SMP, killers/history, null-move pruning and LMR all in,
+goChess plausibly sits in the ~1900–2150 range; a tapered, tuned evaluation with
+pawn-structure and king-safety terms on top is what targets 2300+.
 
 ## Measuring it properly
 

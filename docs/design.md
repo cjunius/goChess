@@ -9,17 +9,17 @@ choices see the [ADRs](adr/).
 ## Architecture
 
 `engine.Search` is the search core. It is a plain function around a `searcher`
-value (node counter + deadline) with a few free collaborators rather than an
-injected object graph — small enough that dependency injection would cost more
-than it buys.
+value (node counter, deadline, per-ply killer moves, `[side][from][to]` history
+table) with a few free collaborators rather than an injected object graph —
+small enough that dependency injection would cost more than it buys.
 
 | collaborator | responsibility |
 |---|---|
 | `dragontoothmg.Board` | board state, legal move generation, `Apply` / unapply, Zobrist hash, FEN — never reimplemented (see [ADR 0002](adr/0002-use-dragontoothmg-for-move-generation.md)) |
 | `engine.Evaluate` | static evaluation from the side-to-move's view (positive = better for that side) |
-| `engine.orderMoves` | orders moves to maximise alpha-beta cut-offs; TT/hash move first, then promotions, then MVV-LVA captures, then quiets |
+| `searcher.orderMoves` | orders moves to maximise alpha-beta cut-offs: TT/hash move, promotions, MVV-LVA captures, the two killer moves for the ply, then quiets by history score |
 | `engine.TT` | shared, lock-free transposition table keyed by `Board.Hash`; probed/stored inside `negamax` and seeded into move ordering |
-| `searcher` | carries the node count, TT handle, shared stop flag and wall-clock deadline; answers `timeUp` and flips `stopped` |
+| `searcher` | carries the node count, TT handle, shared stop flag, wall-clock deadline, and the per-searcher killer/history tables; answers `timeUp` and flips `stopped` |
 
 `internal/uci` is the protocol layer and the only place that prints `info` /
 `bestmove`. It owns the persistent `engine.TT` (`Hash` option) and the `Threads`
@@ -36,7 +36,9 @@ and `bench` subcommands.
 - [Transposition Table](https://www.chessprogramming.org/Transposition_Table) — power-of-two table keyed by `dragontoothmg.Board.Hash()`; stores EXACT / LOWER / UPPER bounds with the best move, mate scores rebased by ply on store and probe. Lock-free (Hyatt XOR) so Lazy-SMP workers share one table. The stored move seeds move ordering even when the entry is too shallow to cut
 - [Lazy SMP](https://www.chessprogramming.org/Lazy_SMP) — `Threads` workers run iterative deepening in parallel on private board copies over the shared TT; workers start at staggered depths so they diverge, and the deepest completed result wins
 - [Quiescence Search](https://www.chessprogramming.org/Quiescence_Search) at the horizon — captures and promotions only, depth-bounded by `maxPly`
-- [Move Ordering](https://www.chessprogramming.org/Move_Ordering) — TT/hash move first, then promotions, then [MVV-LVA](https://www.chessprogramming.org/MVV-LVA) captures, then quiet moves
+- [Null Move Pruning](https://www.chessprogramming.org/Null_Move_Pruning) — `R = 2`, or `3` from depth 6; tried only when not in check, at depth ≥ 3, with a non-mate beta, with non-pawn material for the side to move, and not immediately after another null move. The pass position is built through FEN because `dragontoothmg` keeps the Zobrist hash and en-passant square in unexported fields
+- [Late Move Reductions](https://www.chessprogramming.org/Late_Move_Reductions) — from depth 3, quiet moves past the third in the ordered list are searched 1 ply shallower (2 from the seventh move at depth ≥ 5); a reduced search that beats alpha is repeated at full depth. Moves that give or evade check are never reduced
+- [Move Ordering](https://www.chessprogramming.org/Move_Ordering) — TT/hash move, then promotions, then [MVV-LVA](https://www.chessprogramming.org/MVV-LVA) captures, then the two [killer moves](https://www.chessprogramming.org/Killer_Heuristic) for the ply, then quiet moves by [history](https://www.chessprogramming.org/History_Heuristic) score (`depth²` per beta cut-off, per `[side][from][to]`, clamped). Killer and history tables are per-searcher, so Lazy-SMP workers keep independent copies
 - [Mate-distance scoring](https://www.chessprogramming.org/Mate_Distance_Pruning) — `mateScore - ply`, so the shortest mate is preferred; a proven mate ends iterative deepening early
 - Draw detection — the fifty-move rule (`Halfmoveclock >= 100`) is scored `0` inside the tree
 - Time management — a hard wall-clock budget checked every 2048 nodes; the UCI layer spends `1/30` of the remaining clock when the GUI sends `wtime` / `btime` instead of `movetime`
@@ -55,10 +57,10 @@ update and no pawn or evaluation hash.
 
 ### Search
 
-- [Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search) — null-window scout + re-search
-- [Killer](https://www.chessprogramming.org/Killer_Heuristic) and [history](https://www.chessprogramming.org/History_Heuristic) heuristics in `orderMoves`
-- [Null Move Pruning](https://www.chessprogramming.org/Null_Move_Pruning) and [Late Move Reductions](https://www.chessprogramming.org/Late_Move_Reductions)
+- [Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search) — null-window scout + re-search (LMR already does a null-window reduced search; PVS would extend that to every move past the first)
 - [Aspiration Windows](https://www.chessprogramming.org/Aspiration_Windows) around the previous iteration's score
+- Tuning the null-move and LMR formulas (verification search, adaptive `R`, reduction from the history score) against SPRT
+- [Check extensions](https://www.chessprogramming.org/Check_Extensions) and other search extensions
 - [Static Exchange Evaluation](https://www.chessprogramming.org/Static_Exchange_Evaluation) for capture ordering and bad-capture pruning in quiescence
 - Threefold-[repetition](https://www.chessprogramming.org/Repetitions) detection (needs a position history the current `Search` does not keep)
 - A real principal variation in the `info` line (only `bestmove` is reported today)
