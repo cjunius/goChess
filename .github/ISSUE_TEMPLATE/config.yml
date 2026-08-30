@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/cjunius/goChess/discussions
+    about: Ask how to use the engine, GUI setup, or general chess-programming questions.
+  - name: Security vulnerability
+    url: https://github.com/cjunius/goChess/security/advisories/new
+    about: Report a vulnerability privately (see SECURITY.md).

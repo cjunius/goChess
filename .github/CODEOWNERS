@@ -1,0 +1,12 @@
+# Default owner for everything in the repo.
+*                       @cjunius
+
+# Engine internals — require review from the engine owner.
+/internal/engine/       @cjunius
+/internal/uci/          @cjunius
+
+# Build, CI, and release configuration.
+/.github/               @cjunius
+/Makefile               @cjunius
+/Dockerfile             @cjunius
+/.goreleaser.yaml       @cjunius
