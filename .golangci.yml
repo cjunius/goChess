@@ -1,59 +1,72 @@
-# golangci-lint configuration. Run: make lint  (or: golangci-lint run)
+# golangci-lint configuration (v2 schema). Run: make lint  (or: golangci-lint run)
+version: "2"
 run:
-  timeout: 5m
   tests: true
-
 linters:
   enable:
     - asasalint
     - bodyclose
     - copyloopvar
     - dupl
-    - errcheck
     - errorlint
     - gocritic
     - gocyclo
-    - gofumpt
-    - goimports
     - gosec
-    - govet
-    - ineffassign
     - misspell
     - nakedret
     - nilerr
     - nolintlint
     - predeclared
     - revive
-    - staticcheck
     - unconvert
     - unparam
-    - unused
     - whitespace
-
-linters-settings:
-  gocyclo:
-    min-complexity: 20
-  goimports:
-    local-prefixes: github.com/cjunius/goChess
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-  revive:
+  settings:
+    dupl:
+      threshold: 150
+    gocyclo:
+      min-complexity: 20
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: exported
-        arguments: ["checkPrivateReceivers"]
-  dupl:
-    threshold: 150
-
+      - linters:
+          - dupl
+          - gocyclo
+          - gosec
+          - unparam
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # Test files: allow table-driven duplication and skip some strictness.
-    - path: _test\.go
-      linters:
-        - dupl
-        - gocyclo
-        - gosec
-        - unparam
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cjunius/goChess
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

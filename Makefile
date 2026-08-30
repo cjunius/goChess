@@ -77,13 +77,13 @@ tidy:
 check: tidy lint vuln test
 
 ## dev-tools: install development tooling (versions tracked here and in CI)
-GOLANGCI_VERSION ?= v1.61.0
+GOLANGCI_VERSION ?= v2.13.2
 .PHONY: dev-tools
 dev-tools:
 	$(GO) install mvdan.cc/gofumpt@latest
 	$(GO) install golang.org/x/tools/cmd/goimports@latest
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_VERSION)
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 
 ## docker: build the container image
 .PHONY: docker
