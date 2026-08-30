@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
     -o /out/gochess ./cmd/gochess
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/gochess /usr/local/bin/gochess
 # UCI speaks over stdin/stdout; keep the container attached.
 ENTRYPOINT ["/usr/local/bin/gochess"]
