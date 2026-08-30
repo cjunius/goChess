@@ -17,11 +17,13 @@ than it buys.
 |---|---|
 | `dragontoothmg.Board` | board state, legal move generation, `Apply` / unapply, Zobrist hash, FEN — never reimplemented (see [ADR 0002](adr/0002-use-dragontoothmg-for-move-generation.md)) |
 | `engine.Evaluate` | static evaluation from the side-to-move's view (positive = better for that side) |
-| `engine.orderMoves` | orders moves to maximise alpha-beta cut-offs; currently promotions then MVV-LVA captures then quiets |
-| `searcher` | carries the node count and wall-clock deadline; answers `timeUp` and flips `stopped` |
+| `engine.orderMoves` | orders moves to maximise alpha-beta cut-offs; TT/hash move first, then promotions, then MVV-LVA captures, then quiets |
+| `engine.TT` | shared, lock-free transposition table keyed by `Board.Hash`; probed/stored inside `negamax` and seeded into move ordering |
+| `searcher` | carries the node count, TT handle, shared stop flag and wall-clock deadline; answers `timeUp` and flips `stopped` |
 
 `internal/uci` is the protocol layer and the only place that prints `info` /
-`bestmove`. Search is synchronous, so `stop` is a no-op and `bestmove` is emitted
+`bestmove`. It owns the persistent `engine.TT` (`Hash` option) and the `Threads`
+setting. Search is synchronous, so `stop` is a no-op and `bestmove` is emitted
 as soon as `go` returns. `cmd/gochess` wires these together and adds the `perft`
 and `bench` subcommands.
 
@@ -31,8 +33,10 @@ and `bench` subcommands.
 
 - [Negamax](https://www.chessprogramming.org/Negamax) with [alpha-beta pruning](https://www.chessprogramming.org/Alpha-Beta) — fail-hard
 - [Iterative Deepening](https://www.chessprogramming.org/Iterative_Deepening) — the last fully completed depth is the one returned
+- [Transposition Table](https://www.chessprogramming.org/Transposition_Table) — power-of-two table keyed by `dragontoothmg.Board.Hash()`; stores EXACT / LOWER / UPPER bounds with the best move, mate scores rebased by ply on store and probe. Lock-free (Hyatt XOR) so Lazy-SMP workers share one table. The stored move seeds move ordering even when the entry is too shallow to cut
+- [Lazy SMP](https://www.chessprogramming.org/Lazy_SMP) — `Threads` workers run iterative deepening in parallel on private board copies over the shared TT; workers start at staggered depths so they diverge, and the deepest completed result wins
 - [Quiescence Search](https://www.chessprogramming.org/Quiescence_Search) at the horizon — captures and promotions only, depth-bounded by `maxPly`
-- [Move Ordering](https://www.chessprogramming.org/Move_Ordering) — promotions first, then [MVV-LVA](https://www.chessprogramming.org/MVV-LVA) captures, then quiet moves
+- [Move Ordering](https://www.chessprogramming.org/Move_Ordering) — TT/hash move first, then promotions, then [MVV-LVA](https://www.chessprogramming.org/MVV-LVA) captures, then quiet moves
 - [Mate-distance scoring](https://www.chessprogramming.org/Mate_Distance_Pruning) — `mateScore - ply`, so the shortest mate is preferred; a proven mate ends iterative deepening early
 - Draw detection — the fifty-move rule (`Halfmoveclock >= 100`) is scored `0` inside the tree
 - Time management — a hard wall-clock budget checked every 2048 nodes; the UCI layer spends `1/30` of the remaining clock when the GUI sends `wtime` / `btime` instead of `movetime`
@@ -51,7 +55,6 @@ update and no pawn or evaluation hash.
 
 ### Search
 
-- [Transposition Table](https://www.chessprogramming.org/Transposition_Table) — Zobrist key is already exposed by `dragontoothmg.Board.Hash()`; needs EXACT / LOWER / UPPER bounds and ply-rebased mate scores
 - [Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search) — null-window scout + re-search
 - [Killer](https://www.chessprogramming.org/Killer_Heuristic) and [history](https://www.chessprogramming.org/History_Heuristic) heuristics in `orderMoves`
 - [Null Move Pruning](https://www.chessprogramming.org/Null_Move_Pruning) and [Late Move Reductions](https://www.chessprogramming.org/Late_Move_Reductions)
@@ -59,7 +62,7 @@ update and no pawn or evaluation hash.
 - [Static Exchange Evaluation](https://www.chessprogramming.org/Static_Exchange_Evaluation) for capture ordering and bad-capture pruning in quiescence
 - Threefold-[repetition](https://www.chessprogramming.org/Repetitions) detection (needs a position history the current `Search` does not keep)
 - A real principal variation in the `info` line (only `bestmove` is reported today)
-- [Lazy SMP](https://www.chessprogramming.org/Lazy_SMP) once a shared TT exists
+- Richer Lazy SMP — per-worker root-move splitting, aspiration-window skew, TT ageing / bucketed replacement
 - Asynchronous search so `stop` and pondering actually work
 - [Opening book](https://www.chessprogramming.org/Opening_Book) (Polyglot) and [Syzygy endgame tablebases](https://www.chessprogramming.org/Endgame_Tablebases)
 
