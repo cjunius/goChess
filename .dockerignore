@@ -1,0 +1,11 @@
+.git
+.github
+bin
+dist
+docs
+*.md
+!README.md
+!LICENSE
+*.out
+*.prof
+.golangci.yml

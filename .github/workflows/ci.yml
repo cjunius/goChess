@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.22.x", "1.23.x"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: Verify modules are tidy
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.23.x'
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Build
+        run: go build -v ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race, short)
+        run: go test -race -short -covermode atomic -coverprofile coverage.txt ./...
+      - name: Test (full, incl. deep perft)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./...
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.23.x'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.txt
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...

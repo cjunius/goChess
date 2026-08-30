@@ -1,0 +1,15 @@
+# Normalize line endings
+* text=auto eol=lf
+
+*.go   text diff=golang
+*.md   text
+*.yml  text
+*.yaml text
+
+# Binary
+*.png  binary
+*.bin  binary
+
+# Keep vendored/generated files out of language stats and diffs
+go.sum          linguist-generated=true
+/vendor/**      linguist-vendored=true
