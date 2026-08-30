@@ -82,7 +82,7 @@ GOLANGCI_VERSION ?= v2.13.2
 dev-tools:
 	$(GO) install mvdan.cc/gofumpt@latest
 	$(GO) install golang.org/x/tools/cmd/goimports@latest
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 
 ## docker: build the container image
