@@ -2,10 +2,16 @@ package uci_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dylhunn/dragontoothmg"
+
+	"github.com/cjunius/goChess/internal/engine"
 	"github.com/cjunius/goChess/internal/uci"
 )
 
@@ -177,6 +183,42 @@ func TestPonderStopReleasesBestMoveWithoutHit(t *testing.T) {
 	}
 	if n := strings.Count(out, "bestmove"); n != 1 {
 		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+}
+
+func TestOpeningBookShortCircuitsSearch(t *testing.T) {
+	start := dragontoothmg.ParseFen(dragontoothmg.Startpos)
+	key := engine.PolyglotKey(&start)
+
+	// One entry: start position -> g1f3 (from file 6 row 0, to file 5 row 2).
+	move := uint16(5 | 2<<3 | 6<<6 | 0<<9)
+	var rec [16]byte
+	binary.BigEndian.PutUint64(rec[0:], key)
+	binary.BigEndian.PutUint16(rec[8:], move)
+	binary.BigEndian.PutUint16(rec[10:], 1)
+
+	path := filepath.Join(t.TempDir(), "book.bin")
+	if err := os.WriteFile(path, rec[:], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	start2 := time.Now()
+	out := run(t, strings.Join([]string{
+		"setoption name BookFile value " + path,
+		"setoption name OwnBook value true",
+		"position startpos",
+		"go depth 20",
+		"quit",
+		"",
+	}, "\n"))
+	if elapsed := time.Since(start2); elapsed > time.Second {
+		t.Fatalf("book move took %s — it should skip the search", elapsed)
+	}
+	if !strings.Contains(out, "book loaded: 1 entries") {
+		t.Errorf("book was not loaded:\n%s", out)
+	}
+	if !strings.Contains(out, "bestmove g1f3") {
+		t.Errorf("want the book move g1f3:\n%s", out)
 	}
 }
 

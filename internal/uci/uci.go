@@ -42,6 +42,8 @@ type session struct {
 	hashMB  int
 	threads int
 	ponder  bool // the "Ponder" option; a GUI only sends "go ponder" when set
+	ownBook bool
+	book    *engine.Book
 	search  *activeSearch
 }
 
@@ -83,6 +85,8 @@ func Run(r io.Reader, w io.Writer, version string) error {
 			s.emit("option name Hash type spin default %d min %d max %d\n", defaultHashMB, minHashMB, maxHashMB)
 			s.emit("option name Threads type spin default %d min 1 max %d\n", defaultThreads, maxThreads)
 			s.emit("option name Ponder type check default false\n")
+			s.emit("option name OwnBook type check default false\n")
+			s.emit("option name BookFile type string default\n")
 			s.emit("uciok\n")
 		case "isready":
 			s.ensureTT()
@@ -200,7 +204,27 @@ func (s *session) handleSetOption(args []string) {
 		}
 	case "ponder":
 		s.ponder = strings.EqualFold(value, "true")
+	case "ownbook":
+		s.ownBook = strings.EqualFold(value, "true")
+	case "bookfile":
+		s.loadBook(strings.TrimSpace(value))
 	}
+}
+
+// loadBook (re)loads the Polyglot book. An empty path clears it.
+func (s *session) loadBook(path string) {
+	if path == "" {
+		s.book = nil
+		return
+	}
+	bk, err := engine.OpenBook(path)
+	if err != nil {
+		s.book = nil
+		s.emit("info string book load failed: %v\n", err)
+		return
+	}
+	s.book = bk
+	s.emit("info string book loaded: %d entries\n", bk.Len())
 }
 
 func clamp(v, lo, hi int) int {
@@ -288,6 +312,16 @@ func (s *session) handleGo(args []string) {
 		}
 	}
 	params.MoveTime = movetime
+
+	// An in-book move short-circuits the search entirely (but never while
+	// pondering — there is nothing to ponder on a book move).
+	if s.ownBook && s.book != nil && !ponder {
+		if mv, ok := s.book.Probe(&s.board); ok {
+			s.emit("info depth 0 score cp 0 pv %s\n", mv.String())
+			s.emit("bestmove %s\n", mv.String())
+			return
+		}
+	}
 
 	s.ensureTT()
 	params.TT = s.tt
