@@ -2,9 +2,16 @@ package uci_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/dylhunn/dragontoothmg"
+
+	"github.com/cjunius/goChess/internal/engine"
 	"github.com/cjunius/goChess/internal/uci"
 )
 
@@ -123,5 +130,110 @@ func TestStopAndUnknownGoArgsAreHarmless(t *testing.T) {
 	out := run(t, "position startpos\ngo depth 2 winc 100 movestogo 40\nstop\nquit\n")
 	if !strings.Contains(out, "bestmove ") {
 		t.Errorf("expected a bestmove:\n%s", out)
+	}
+}
+
+func TestUciAdvertisesPonderOption(t *testing.T) {
+	out := run(t, "uci\nquit\n")
+	if !strings.Contains(out, "option name Ponder type check default false") {
+		t.Errorf("missing Ponder option:\n%s", out)
+	}
+}
+
+func TestInfiniteSearchStopsOnStop(t *testing.T) {
+	start := time.Now()
+	out := run(t, "position startpos\ngo infinite\nstop\nquit\n")
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("infinite search took %s to stop", elapsed)
+	}
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+}
+
+func TestPonderHitReleasesBestMove(t *testing.T) {
+	// White has mate in one (a1a8). Pondering, then ponderhit lets the search
+	// spend its budget, find the mate and report it.
+	out := run(t, strings.Join([]string{
+		"position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1",
+		"go ponder movetime 2000",
+		"ponderhit",
+		"quit",
+		"",
+	}, "\n"))
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "bestmove a1a8") {
+		t.Errorf("want 'bestmove a1a8' after ponderhit:\n%s", out)
+	}
+}
+
+func TestPonderStopReleasesBestMoveWithoutHit(t *testing.T) {
+	start := time.Now()
+	out := run(t, strings.Join([]string{
+		"position startpos moves e2e4",
+		"go ponder wtime 60000 btime 60000",
+		"stop",
+		"quit",
+		"",
+	}, "\n"))
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("pondering search took %s to stop after 'stop'", elapsed)
+	}
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+}
+
+func TestOpeningBookShortCircuitsSearch(t *testing.T) {
+	start := dragontoothmg.ParseFen(dragontoothmg.Startpos)
+	key := engine.PolyglotKey(&start)
+
+	// One entry: start position -> g1f3 (from file 6 row 0, to file 5 row 2).
+	move := uint16(5 | 2<<3 | 6<<6 | 0<<9)
+	var rec [16]byte
+	binary.BigEndian.PutUint64(rec[0:], key)
+	binary.BigEndian.PutUint16(rec[8:], move)
+	binary.BigEndian.PutUint16(rec[10:], 1)
+
+	path := filepath.Join(t.TempDir(), "book.bin")
+	if err := os.WriteFile(path, rec[:], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	start2 := time.Now()
+	out := run(t, strings.Join([]string{
+		"setoption name BookFile value " + path,
+		"setoption name OwnBook value true",
+		"position startpos",
+		"go depth 20",
+		"quit",
+		"",
+	}, "\n"))
+	if elapsed := time.Since(start2); elapsed > time.Second {
+		t.Fatalf("book move took %s — it should skip the search", elapsed)
+	}
+	if !strings.Contains(out, "book loaded: 1 entries") {
+		t.Errorf("book was not loaded:\n%s", out)
+	}
+	if !strings.Contains(out, "bestmove g1f3") {
+		t.Errorf("want the book move g1f3:\n%s", out)
+	}
+}
+
+func TestBestMoveCarriesPonderMove(t *testing.T) {
+	out := run(t, "position startpos\ngo depth 6\nquit\n")
+	if !strings.Contains(out, "bestmove ") {
+		t.Fatalf("no bestmove:\n%s", out)
+	}
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "bestmove ") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, " ponder ") {
+		t.Errorf("bestmove line has no ponder move: %q", line)
 	}
 }

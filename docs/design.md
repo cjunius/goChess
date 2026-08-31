@@ -10,8 +10,9 @@ choices see the [ADRs](adr/).
 
 `engine.Search` is the search core. It is a plain function around a `searcher`
 value (node counter, deadline, per-ply killer moves, `[side][from][to]` history
-table) with a few free collaborators rather than an injected object graph —
-small enough that dependency injection would cost more than it buys.
+table, triangular PV table) with a few free collaborators rather than an
+injected object graph — small enough that dependency injection would cost more
+than it buys.
 
 | collaborator | responsibility |
 |---|---|
@@ -22,33 +23,37 @@ small enough that dependency injection would cost more than it buys.
 | `searcher` | carries the node count, TT handle, shared stop flag, wall-clock deadline, and the per-searcher killer/history tables; answers `timeUp` and flips `stopped` |
 
 `internal/uci` is the protocol layer and the only place that prints `info` /
-`bestmove`. It owns the persistent `engine.TT` (`Hash` option) and the `Threads`
-setting. Search is synchronous, so `stop` is a no-op and `bestmove` is emitted
-as soon as `go` returns. `cmd/gochess` wires these together and adds the `perft`
-and `bench` subcommands.
+`bestmove`. It owns the persistent `engine.TT` (`Hash` option), the `Threads` /
+`Ponder` settings, and the optional Polyglot book (`OwnBook` / `BookFile`). It
+runs `Search` on a goroutine and serialises stdout with a mutex, so `stop`,
+`ponderhit` and streamed `info` all work while the search runs. `cmd/gochess`
+wires these together and adds the `perft` and `bench` subcommands.
 
 ## Implemented
 
 ### [Search](https://www.chessprogramming.org/Search)
 
-- [Negamax](https://www.chessprogramming.org/Negamax) with [alpha-beta pruning](https://www.chessprogramming.org/Alpha-Beta) — fail-hard
-- [Iterative Deepening](https://www.chessprogramming.org/Iterative_Deepening) — the last fully completed depth is the one returned
-- [Transposition Table](https://www.chessprogramming.org/Transposition_Table) — power-of-two table keyed by `dragontoothmg.Board.Hash()`; stores EXACT / LOWER / UPPER bounds with the best move, mate scores rebased by ply on store and probe. Lock-free (Hyatt XOR) so Lazy-SMP workers share one table. The stored move seeds move ordering even when the entry is too shallow to cut
-- [Lazy SMP](https://www.chessprogramming.org/Lazy_SMP) — `Threads` workers run iterative deepening in parallel on private board copies over the shared TT; workers start at staggered depths so they diverge, and the deepest completed result wins
+- [Negamax](https://www.chessprogramming.org/Negamax) with [alpha-beta pruning](https://www.chessprogramming.org/Alpha-Beta), fail-soft, and [Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search) — the first move at each node gets a full window, later moves a null-window scout re-searched only when it beats alpha (LMR is folded in as an extra reduction on that scout)
+- [Iterative Deepening](https://www.chessprogramming.org/Iterative_Deepening) with [Aspiration Windows](https://www.chessprogramming.org/Aspiration_Windows) — from depth 5 each iteration first searches a ±25 cp window around the previous score, doubling the failing side until the score lands inside. The last fully completed depth is the one returned
+- A real [principal variation](https://www.chessprogramming.org/Principal_Variation) — a triangular PV table produces the full line, streamed in the `info … pv …` output each iteration
+- [Transposition Table](https://www.chessprogramming.org/Transposition_Table) — power-of-two table keyed by `dragontoothmg.Board.Hash()`; stores EXACT / LOWER / UPPER bounds with the best move, mate scores rebased by ply on store and probe. Lock-free (Hyatt XOR) so Lazy-SMP workers share one table. The stored move seeds move ordering even when the entry is too shallow to cut. A 6-bit generation ages entries: a new search (`NewSearch`) reclaims the previous search's slots regardless of their depth
+- [Lazy SMP](https://www.chessprogramming.org/Lazy_SMP) — `Threads` workers run iterative deepening in parallel on private board copies over the shared TT; workers start at staggered depths, and helpers additionally skew their root move order and use a wider, asymmetric aspiration window so they diverge. The deepest completed result wins
+- Asynchronous search — the UCI layer runs `Search` on a goroutine, so `stop` aborts immediately and pondering (`go ponder` / `ponderhit`) works; a pondering search ignores the clock until the ponder move is confirmed
 - [Quiescence Search](https://www.chessprogramming.org/Quiescence_Search) at the horizon — captures and promotions only, depth-bounded by `maxPly`
 - [Null Move Pruning](https://www.chessprogramming.org/Null_Move_Pruning) — `R = 2`, or `3` from depth 6; tried only when not in check, at depth ≥ 3, with a non-mate beta, with non-pawn material for the side to move, and not immediately after another null move. The pass position is built through FEN because `dragontoothmg` keeps the Zobrist hash and en-passant square in unexported fields
 - [Late Move Reductions](https://www.chessprogramming.org/Late_Move_Reductions) — from depth 3, quiet moves past the third in the ordered list are searched 1 ply shallower (2 from the seventh move at depth ≥ 5); a reduced search that beats alpha is repeated at full depth. Moves that give or evade check are never reduced
 - [Move Ordering](https://www.chessprogramming.org/Move_Ordering) — TT/hash move, then promotions, then [MVV-LVA](https://www.chessprogramming.org/MVV-LVA) captures, then the two [killer moves](https://www.chessprogramming.org/Killer_Heuristic) for the ply, then quiet moves by [history](https://www.chessprogramming.org/History_Heuristic) score (`depth²` per beta cut-off, per `[side][from][to]`, clamped). Killer and history tables are per-searcher, so Lazy-SMP workers keep independent copies
 - [Mate-distance scoring](https://www.chessprogramming.org/Mate_Distance_Pruning) — `mateScore - ply`, so the shortest mate is preferred; a proven mate ends iterative deepening early
 - Draw detection — the fifty-move rule (`Halfmoveclock >= 100`) is scored `0` inside the tree
-- Time management — a hard wall-clock budget checked every 2048 nodes; the UCI layer spends `1/30` of the remaining clock when the GUI sends `wtime` / `btime` instead of `movetime`
+- Time management — a hard wall-clock budget checked every 2048 nodes; the UCI layer spends `1/30` of the remaining clock plus `3/4` of the increment when the GUI sends `wtime` / `btime` (`winc` / `binc`) instead of `movetime`
+- [Opening book](https://www.chessprogramming.org/Opening_Book) — optional [Polyglot](http://hgm.nubati.net/book_format.html) `.bin` book (`OwnBook` / `BookFile`); a book hit is played instantly with no search
 - King-capture guard — scores the illegal position `dragontoothmg` can hand back when the side not to move was already in check, instead of panicking on an empty king bitboard
 
 ### [Evaluation](https://www.chessprogramming.org/Evaluation)
 
-- Material — standard centipawn values (`P 100 · N 320 · B 330 · R 500 · Q 900`)
-- [Piece-square tables](https://www.chessprogramming.org/Piece-Square_Tables) — Michniewski's "simplified evaluation function", single (non-tapered) set; black reads the vertically mirrored square (`sq^56`)
-- [Bishop pair](https://www.chessprogramming.org/Bishop_Pair) — `+30` for holding both bishops
+- [Tapered eval](https://www.chessprogramming.org/Tapered_Eval) — [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) middlegame/endgame material values and piece-square tables interpolated by game phase (`N/B = 1`, `R = 2`, `Q = 4`, clamped to 24); black reads the vertically mirrored square (`sq^56`)
+- [Bishop pair](https://www.chessprogramming.org/Bishop_Pair), [passed pawns](https://www.chessprogramming.org/Passed_Pawn) (bonus by rank, endgame-weighted), [mobility](https://www.chessprogramming.org/Mobility) for N/B/R/Q, [king safety](https://www.chessprogramming.org/King_Safety) (attacker weight in the king ring + missing-pawn-shield penalty, middlegame only), and a [tempo](https://www.chessprogramming.org/Tempo) bonus — all accumulated as `(mg, eg)` pairs and folded into the taper
+- A colour-mirror symmetry test guards the whole evaluation
 
 Evaluation is recomputed from scratch on every call; there is no incremental
 update and no pawn or evaluation hash.
@@ -57,22 +62,17 @@ update and no pawn or evaluation hash.
 
 ### Search
 
-- [Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search) — null-window scout + re-search (LMR already does a null-window reduced search; PVS would extend that to every move past the first)
-- [Aspiration Windows](https://www.chessprogramming.org/Aspiration_Windows) around the previous iteration's score
-- Tuning the null-move and LMR formulas (verification search, adaptive `R`, reduction from the history score) against SPRT
+- Tuning the aspiration / null-move / LMR formulas (adaptive `R`, reduction from the history score) against SPRT
 - [Check extensions](https://www.chessprogramming.org/Check_Extensions) and other search extensions
 - [Static Exchange Evaluation](https://www.chessprogramming.org/Static_Exchange_Evaluation) for capture ordering and bad-capture pruning in quiescence
 - Threefold-[repetition](https://www.chessprogramming.org/Repetitions) detection (needs a position history the current `Search` does not keep)
-- A real principal variation in the `info` line (only `bestmove` is reported today)
-- Richer Lazy SMP — per-worker root-move splitting, aspiration-window skew, TT ageing / bucketed replacement
-- Asynchronous search so `stop` and pondering actually work
-- [Opening book](https://www.chessprogramming.org/Opening_Book) (Polyglot) and [Syzygy endgame tablebases](https://www.chessprogramming.org/Endgame_Tablebases)
+- [Syzygy endgame tablebases](https://www.chessprogramming.org/Endgame_Tablebases) — deferred; see [ADR 0003](adr/0003-defer-syzygy-tablebases.md)
 
 ### Evaluation
 
-- [Tapered eval](https://www.chessprogramming.org/Tapered_Eval) — mid/endgame PST pairs interpolated by game phase ([PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function))
-- Pawn structure — [passed](https://www.chessprogramming.org/Passed_Pawn) / [isolated](https://www.chessprogramming.org/Isolated_Pawn) / [doubled](https://www.chessprogramming.org/Doubled_Pawn) / [backward](https://www.chessprogramming.org/Backward_Pawn) pawns
-- [Mobility](https://www.chessprogramming.org/Mobility), [rook on open file](https://www.chessprogramming.org/Rook_on_Open_File), [knight outposts](https://www.chessprogramming.org/Outpost), [king safety](https://www.chessprogramming.org/King_Safety), [tempo](https://www.chessprogramming.org/Tempo)
+- Pawn structure — [isolated](https://www.chessprogramming.org/Isolated_Pawn) / [doubled](https://www.chessprogramming.org/Doubled_Pawn) / [backward](https://www.chessprogramming.org/Backward_Pawn) pawns
+- [Rook on open file](https://www.chessprogramming.org/Rook_on_Open_File), [knight outposts](https://www.chessprogramming.org/Outpost)
+- Evaluation-weight tuning (Texel / gradient) against a labelled position set
 - [Incremental updates](https://www.chessprogramming.org/Incremental_Updates) of material + PST on make/unmake
 - [Pawn](https://www.chessprogramming.org/Pawn_Hash_Table) and [evaluation](https://www.chessprogramming.org/Evaluation_Hash_Table) hash tables
 

@@ -167,6 +167,40 @@ func TestSearchPrunedResultMatchesPlainOnTactics(t *testing.T) {
 	}
 }
 
+func TestSearchReportsPrincipalVariation(t *testing.T) {
+	b := dragontoothmg.ParseFen(dragontoothmg.Startpos)
+	res := engine.Search(&b, engine.SearchParams{MaxDepth: 6})
+	if len(res.PV) < 2 {
+		t.Fatalf("PV = %v, want at least two moves deep", res.PV)
+	}
+	if res.PV[0] != res.BestMove {
+		t.Errorf("PV[0] = %s, want it to equal BestMove %s", res.PV[0].String(), res.BestMove.String())
+	}
+	// Every PV move must be legal in sequence.
+	bb := dragontoothmg.ParseFen(dragontoothmg.Startpos)
+	for i, m := range res.PV {
+		legal := false
+		for _, lm := range bb.GenerateLegalMoves() {
+			if lm == m {
+				legal = true
+				break
+			}
+		}
+		if !legal {
+			t.Fatalf("PV move %d (%s) is not legal in the line", i, m.String())
+		}
+		bb.Apply(m)
+	}
+}
+
+func TestSearchMateInOnePVIsOneMove(t *testing.T) {
+	b := dragontoothmg.ParseFen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1")
+	res := engine.Search(&b, engine.SearchParams{MaxDepth: 3})
+	if len(res.PV) != 1 || res.PV[0].String() != "a1a8" {
+		t.Fatalf("PV = %v, want exactly [a1a8]", res.PV)
+	}
+}
+
 const (
 	mateThreshold     = 1_000_000 - 64
 	maxDepthUnbounded = 64

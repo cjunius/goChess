@@ -3,7 +3,6 @@
 [![CI](https://github.com/cjunius/goChess/actions/workflows/ci.yml/badge.svg)](https://github.com/cjunius/goChess/actions/workflows/ci.yml)
 [![Lint](https://github.com/cjunius/goChess/actions/workflows/lint.yml/badge.svg)](https://github.com/cjunius/goChess/actions/workflows/lint.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cjunius/goChess.svg)](https://pkg.go.dev/github.com/cjunius/goChess)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cjunius/goChess)](https://goreportcard.com/report/github.com/cjunius/goChess)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 A UCI chess engine written in Go, built on the
@@ -15,13 +14,16 @@ move generator.
 Early. The engine plays legal chess via a UCI loop with:
 
 - **Move generation** — delegated to `dragontoothmg` (verified with perft).
-- **Evaluation** — material + piece-square tables + bishop pair.
-- **Search** — iterative deepening, negamax alpha-beta, quiescence search,
-  a shared transposition table with hash-move ordering, MVV-LVA + killer-move +
-  history move ordering, null-move pruning, late move reductions, Lazy SMP
-  (multi-threaded search), hard time limits.
+- **Evaluation** — tapered PeSTO material + piece-square tables, bishop pair,
+  passed pawns, mobility, king safety, tempo.
+- **Search** — iterative deepening with aspiration windows, principal variation
+  search, quiescence search, a shared aged transposition table with hash-move
+  ordering, MVV-LVA + killer-move + history move ordering, null-move pruning,
+  late move reductions, Lazy SMP (multi-threaded search), asynchronous search
+  with working `stop` and pondering, hard time limits.
+- **Opening book** — optional Polyglot `.bin` book.
 
-Not yet implemented: aspiration windows / PVS, opening book, endgame tablebases.
+Not yet implemented: Syzygy endgame tablebases, static exchange evaluation.
 See the [roadmap](#roadmap).
 
 ## Install
@@ -65,6 +67,9 @@ go movetime 1000
 |---|---|---|---|
 | `Hash` | 64 | 1–4096 | Transposition-table size in MiB. |
 | `Threads` | 1 | 1–256 | Lazy-SMP worker count (capped at the machine's core count at search time). |
+| `Ponder` | false | check | Let a GUI drive `go ponder` / `ponderhit` so the engine thinks on the opponent's clock. |
+| `OwnBook` | false | check | Play from the Polyglot book when the position is in it. |
+| `BookFile` | — | string | Path to a Polyglot `.bin` book; loaded when set. |
 
 ## Development
 
@@ -97,8 +102,11 @@ docs/              architecture notes and ADRs
 - [x] Lazy SMP — multi-threaded search over the shared TT (`Threads` UCI option)
 - [x] Killer moves + history heuristic
 - [x] Null-move pruning + late move reductions
-- [ ] Aspiration windows / principal variation search
-- [ ] Opening book (Polyglot) and Syzygy tablebase probing
+- [x] Aspiration windows + principal variation search
+- [x] Tapered PeSTO evaluation + pawn/mobility/king-safety terms
+- [x] Asynchronous search — working `stop` and pondering
+- [x] Opening book (Polyglot)
+- [ ] Syzygy tablebase probing ([ADR 0003](docs/adr/0003-defer-syzygy-tablebases.md))
 - [ ] Strength testing harness (SPRT via cutechess-cli)
 
 ## License

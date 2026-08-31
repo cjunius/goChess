@@ -84,6 +84,27 @@ func TestTTMateScoreIsRebasedByPly(t *testing.T) {
 	}
 }
 
+func TestTTAgeingReclaimsPreviousSearch(t *testing.T) {
+	tt := NewTT(1)
+	key := uint64(0x1234)
+	deep, _ := dragontoothmg.ParseMove("e2e4")
+	shallow, _ := dragontoothmg.ParseMove("d2d4")
+
+	// Within one generation, a deeper entry is kept over a shallower store.
+	tt.store(key, 12, 5, boundExact, deep, 0)
+	tt.store(key, 4, 9, boundExact, shallow, 0)
+	if _, got, _ := tt.probe(key, 4, -100, 100, 0); got != deep {
+		t.Errorf("same-generation deeper entry was overwritten: got %s", got.String())
+	}
+
+	// A new search must overwrite it even with a shallower result.
+	tt.NewSearch()
+	tt.store(key, 4, 9, boundExact, shallow, 0)
+	if _, got, _ := tt.probe(key, 4, -100, 100, 0); got != shallow {
+		t.Errorf("stale-generation entry not reclaimed: got %s, want %s", got.String(), shallow.String())
+	}
+}
+
 func TestTTMissOnKeyMismatch(t *testing.T) {
 	tt := NewTT(1)
 	tt.store(1, 5, 10, boundExact, 0, 0)

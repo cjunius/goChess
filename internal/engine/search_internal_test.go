@@ -224,6 +224,40 @@ func TestNegamaxLeavesBoardUnmodified(t *testing.T) {
 	}
 }
 
+func TestAspirationWindowMatchesFullWindow(t *testing.T) {
+	fens := []string{
+		dragontoothmg.Startpos,
+		"r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+		"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+	}
+	const depth = 5
+	for _, fen := range fens {
+		b := dragontoothmg.ParseFen(fen)
+
+		// No deadline: both searches are depth-bounded, so they always finish —
+		// this keeps the comparison meaningful on a slow -race CI runner.
+		full := &searcher{tt: NewTT(8)}
+		wantScore, wantMove, ok := full.searchRoot(&b, depth, -infinity, infinity)
+		if !ok {
+			t.Fatalf("%s: full-window searchRoot did not complete", fen)
+		}
+
+		// Feed searchDepth the true score as the previous iteration's guess so the
+		// aspiration window is tight — the hardest case for it to get right.
+		asp := &searcher{tt: NewTT(8)}
+		gotScore, gotMove, ok := asp.searchDepth(&b, depth, wantScore)
+		if !ok {
+			t.Fatalf("%s: searchDepth did not complete", fen)
+		}
+		if gotScore != wantScore {
+			t.Errorf("%s: aspiration score %d, full-window score %d", fen, gotScore, wantScore)
+		}
+		if gotMove != wantMove {
+			t.Errorf("%s: aspiration move %s, full-window move %s", fen, gotMove.String(), wantMove.String())
+		}
+	}
+}
+
 // field returns the i-th space-separated field of a FEN string.
 func field(fen string, i int) string {
 	start, n := 0, 0

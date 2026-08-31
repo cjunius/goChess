@@ -1,10 +1,17 @@
 # Performance
 
-Benchmark of the current engine (iterative deepening, negamax alpha-beta,
-bounded quiescence, a shared transposition table, MVV-LVA + killer + history
-move ordering, null-move pruning, late move reductions, Lazy SMP, hard time
-limit) on one machine: Apple M4, 10 cores, Go 1.27, `darwin/arm64`. Search is
-from the starting position unless noted. "Nodes" is the engine's node counter
+> Note: the node counts and depths below were measured before principal
+> variation search, aspiration windows and the tapered PeSTO evaluation landed.
+> The shape of the story (narrow tree, modest SMP overlap) still holds; the
+> exact figures will be lower on nodes / higher on depth. Re-benchmark before
+> quoting.
+
+Benchmark of the engine (iterative deepening, fail-soft negamax alpha-beta with
+principal variation search and aspiration windows, bounded quiescence, a shared
+aged transposition table, MVV-LVA + killer + history move ordering, null-move
+pruning, late move reductions, Lazy SMP, hard time limit) on one machine: Apple
+M4, 10 cores, Go 1.27, `darwin/arm64`. Search is from the starting position
+unless noted. "Nodes" is the engine's node counter
 (`negamax` + `quiesce` calls). Numbers are single-run and rounded; with a shared
 TT and multiple workers the search is no longer bit-for-bit deterministic, so
 node counts wobble a few percent between runs.
@@ -47,11 +54,12 @@ pruning search a tree much narrower than full-width minimax.
 
 ## Lazy SMP scaling
 
-Basic Lazy SMP: workers share the TT and start at staggered depths, but there is
-no root-move splitting or aspiration-window skew yet, so on TT-friendly
-positions the workers largely re-explore the same tree. The value shows up as
-extra breadth and tactical robustness, and as a modest depth gain at fixed time.
-Approximate, `movetime 2000` from the start position:
+Lazy SMP: workers share the TT (aged per search) and start at staggered depths;
+helpers also skew their root move order and use a wider, asymmetric aspiration
+window. There is still no explicit root-move splitting or shared-PV coordination,
+so on TT-friendly positions the workers overlap substantially. The value shows
+up as extra breadth and tactical robustness, and as a modest depth gain at fixed
+time. Approximate, `movetime 2000` from the start position:
 
 | threads | depth reached | nodes |
 |--------:|--------------:|------:|

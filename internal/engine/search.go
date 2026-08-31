@@ -30,6 +30,14 @@ const (
 	// historyMax caps a history counter so repeated cut-offs cannot dwarf the
 	// capture scores in move ordering.
 	historyMax = 1 << 22
+
+	// Aspiration windows: from aspMinDepth, each iteration first searches a
+	// window aspBaseDelta wide centred on the previous score, doubling the delta
+	// on the side that fails until the score lands inside or the window has
+	// grown past aspMaxDelta (at which point it opens fully).
+	aspMinDepth  = 5
+	aspBaseDelta = 25
+	aspMaxDelta  = 400
 )
 
 // SearchParams controls a single Search call.
@@ -47,6 +55,28 @@ type SearchParams struct {
 	// carried between moves — callers that want that (the UCI layer) pass a
 	// table they own.
 	TT *TT
+
+	// Stop, when non-nil, lets the caller abort the search from another
+	// goroutine. It is checked alongside the internal time-limit flag.
+	Stop *atomic.Bool
+	// Ponder starts the search in pondering mode: the MoveTime budget is ignored
+	// until PonderHit is set (the opponent played the expected move) or Stop is
+	// raised. On the first observation of PonderHit the budget starts counting
+	// from that moment.
+	Ponder    bool
+	PonderHit *atomic.Bool
+	// Info, when non-nil, is called once per completed iteration with the
+	// current best line, for streaming "info" output.
+	Info func(SearchInfo)
+}
+
+// SearchInfo is one iteration's summary, passed to SearchParams.Info.
+type SearchInfo struct {
+	Depth   int
+	Score   int
+	Nodes   int64
+	Elapsed time.Duration
+	PV      []dragontoothmg.Move
 }
 
 // SearchResult is the outcome of a Search call.
@@ -56,15 +86,38 @@ type SearchResult struct {
 	Depth    int
 	Nodes    int64
 	Elapsed  time.Duration
+	// PV is the principal variation for the deepest completed iteration, best
+	// move first. PV[0] equals BestMove whenever the search completed a depth.
+	PV []dragontoothmg.Move
+}
+
+// searchOpts bundles the per-call runtime controls shared by every Lazy-SMP
+// worker (all read-only during the search except the atomics).
+type searchOpts struct {
+	tt        *TT
+	stop      *atomic.Bool // internal: set on time-up or a proven mate
+	extStop   *atomic.Bool // caller's abort flag (UCI "stop"), or nil
+	deadline  time.Time    // zero until armed; unset while pondering
+	budget    time.Duration
+	ponder    bool
+	ponderHit *atomic.Bool
+	start     time.Time
+	info      func(SearchInfo)
 }
 
 type searcher struct {
-	tt       *TT
-	stop     *atomic.Bool // shared across Lazy-SMP workers; set once time is up
-	id       int
-	nodes    int64
-	deadline time.Time
-	stopped  bool
+	tt        *TT
+	stop      *atomic.Bool // shared across Lazy-SMP workers; set once time is up
+	extStop   *atomic.Bool
+	id        int
+	nodes     int64
+	deadline  time.Time
+	budget    time.Duration
+	ponder    bool
+	ponderHit *atomic.Bool
+	start     time.Time
+	info      func(SearchInfo) // non-nil only for the reporting worker
+	stopped   bool
 
 	// killers holds, per ply, up to two quiet moves that most recently caused a
 	// beta cut-off at that ply; history accumulates depth^2 for every quiet move
@@ -72,11 +125,43 @@ type searcher struct {
 	// so Lazy-SMP workers keep independent tables and need no synchronisation.
 	killers [maxPly + 1][2]dragontoothmg.Move
 	history [2][64][64]int
+
+	// pv is a triangular principal-variation table: pv[ply][:pvLen[ply]] is the
+	// best line found from that ply down, maintained only at nodes that raise
+	// alpha. The root line is pv[0][:pvLen[0]].
+	pv    [maxPly + 1][maxPly + 1]dragontoothmg.Move
+	pvLen [maxPly + 1]int
+}
+
+// setPV records m as the best move at ply and splices the child line at ply+1
+// behind it. Called whenever a move raises alpha.
+func (s *searcher) setPV(ply int, m dragontoothmg.Move) {
+	s.pv[ply][0] = m
+	if ply+1 >= len(s.pv) {
+		s.pvLen[ply] = 1
+		return
+	}
+	n := copy(s.pv[ply][1:], s.pv[ply+1][:s.pvLen[ply+1]])
+	s.pvLen[ply] = n + 1
 }
 
 func (s *searcher) timeUp() bool {
 	if s.stop != nil && s.stop.Load() {
 		return true
+	}
+	if s.extStop != nil && s.extStop.Load() {
+		return true
+	}
+	if s.ponder {
+		// Pondering: ignore the clock until the opponent plays the expected
+		// move, then start the budget from now.
+		if s.ponderHit == nil || !s.ponderHit.Load() {
+			return false
+		}
+		s.ponder = false
+		if s.budget > 0 {
+			s.deadline = time.Now().Add(s.budget)
+		}
 	}
 	if s.deadline.IsZero() {
 		return false
@@ -108,20 +193,51 @@ func Search(b *dragontoothmg.Board, p SearchParams) SearchResult {
 		return res
 	}
 
-	var deadline time.Time
-	if p.MoveTime > 0 {
-		deadline = start.Add(p.MoveTime)
+	opts := searchOpts{
+		tt:        tt,
+		stop:      new(atomic.Bool),
+		extStop:   p.Stop,
+		budget:    p.MoveTime,
+		ponder:    p.Ponder,
+		ponderHit: p.PonderHit,
+		start:     start,
+		info:      p.Info,
 	}
-	stop := new(atomic.Bool)
+	if p.MoveTime > 0 && !p.Ponder {
+		opts.deadline = start.Add(p.MoveTime)
+	}
 
+	tt.NewSearch()
 	if threads > 1 {
-		res = searchLazySMP(b, p.MaxDepth, deadline, stop, tt, threads)
+		res = searchLazySMP(b, p.MaxDepth, threads, opts)
 	} else {
-		s := &searcher{tt: tt, stop: stop, deadline: deadline}
-		res = s.runIterativeDeepening(b, p.MaxDepth, 1)
+		// Search a copy so a concurrent caller (the UCI read loop) may keep
+		// using its own board while this search runs.
+		board := *b
+		res = newSearcher(0, opts, true).runIterativeDeepening(&board, p.MaxDepth, 1)
 	}
 	res.Elapsed = time.Since(start)
 	return res
+}
+
+// newSearcher builds a worker from the shared options. reporting is true for the
+// single worker that streams Info output.
+func newSearcher(id int, opts searchOpts, reporting bool) *searcher {
+	s := &searcher{
+		tt:        opts.tt,
+		stop:      opts.stop,
+		extStop:   opts.extStop,
+		deadline:  opts.deadline,
+		budget:    opts.budget,
+		ponder:    opts.ponder,
+		ponderHit: opts.ponderHit,
+		start:     opts.start,
+		id:        id,
+	}
+	if reporting {
+		s.info = opts.info
+	}
+	return s
 }
 
 // searchLazySMP runs `threads` workers over one shared transposition table. Each
@@ -129,7 +245,7 @@ func Search(b *dragontoothmg.Board, p SearchParams) SearchResult {
 // a different start depth diverge into different subtrees, and the shared TT
 // lets every worker profit from what the others have already searched. The
 // deepest completed result wins. See https://www.chessprogramming.org/Lazy_SMP.
-func searchLazySMP(b *dragontoothmg.Board, maxDepth int, deadline time.Time, stop *atomic.Bool, tt *TT, threads int) SearchResult {
+func searchLazySMP(b *dragontoothmg.Board, maxDepth, threads int, opts searchOpts) SearchResult {
 	results := make([]SearchResult, threads)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
@@ -143,8 +259,7 @@ func searchLazySMP(b *dragontoothmg.Board, maxDepth int, deadline time.Time, sto
 			if startDepth > maxDepth {
 				startDepth = maxDepth
 			}
-			s := &searcher{tt: tt, stop: stop, deadline: deadline, id: id}
-			results[id] = s.runIterativeDeepening(&board, maxDepth, startDepth)
+			results[id] = newSearcher(id, opts, id == 0).runIterativeDeepening(&board, maxDepth, startDepth)
 		}(i)
 	}
 	wg.Wait()
@@ -174,12 +289,24 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 	}
 	res.BestMove = root[0]
 
+	prevScore := 0
 	for depth := startDepth; depth <= maxDepth; depth++ {
-		score, move, ok := s.searchRoot(b, depth)
+		score, move, ok := s.searchDepth(b, depth, prevScore)
 		if !ok {
 			break // out of time: keep the previous completed depth
 		}
 		res.BestMove, res.Score, res.Depth = move, score, depth
+		res.PV = append(res.PV[:0], s.pv[0][:s.pvLen[0]]...)
+		prevScore = score
+		if s.info != nil {
+			s.info(SearchInfo{
+				Depth:   depth,
+				Score:   score,
+				Nodes:   s.nodes,
+				Elapsed: time.Since(s.start),
+				PV:      res.PV,
+			})
+		}
 		if score >= mateThreshold || score <= -mateThreshold {
 			if s.stop != nil {
 				s.stop.Store(true) // forced mate: let the other workers stop too
@@ -194,16 +321,91 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 	return res
 }
 
-func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, best dragontoothmg.Move, ok bool) {
+// searchDepth runs one iterative-deepening iteration for depth. From aspMinDepth
+// it wraps searchRoot in an aspiration window centred on the previous score,
+// widening the failing side until the score lands inside; shallow depths and
+// positions with a known mate score search the full window directly.
+func (s *searcher) searchDepth(b *dragontoothmg.Board, depth, prevScore int) (int, dragontoothmg.Move, bool) {
+	if depth < aspMinDepth || prevScore >= mateThreshold || prevScore <= -mateThreshold {
+		return s.searchRoot(b, depth, -infinity, infinity)
+	}
+
+	alpha, beta, delta := s.aspWindow(prevScore)
+	for {
+		score, move, ok := s.searchRoot(b, depth, alpha, beta)
+		if !ok {
+			return 0, dragontoothmg.Move(0), false
+		}
+		switch {
+		case score <= alpha:
+			alpha = max(alpha-delta, -infinity)
+			delta *= 2
+		case score >= beta:
+			beta = min(beta+delta, infinity)
+			delta *= 2
+		default:
+			return score, move, true
+		}
+		if delta > aspMaxDelta {
+			alpha, beta = -infinity, infinity
+		}
+	}
+}
+
+// aspWindow returns the initial aspiration window and delta for this searcher.
+// Lazy-SMP helpers (id > 0) widen the delta and skew the window asymmetrically
+// so they hit fail-high / fail-low boundaries at different points than worker 0,
+// diverging onto different parts of the tree.
+func (s *searcher) aspWindow(prev int) (alpha, beta, delta int) {
+	delta = aspBaseDelta + 10*s.id
+	lo, hi := delta, delta
+	switch {
+	case s.id == 0:
+	case s.id&1 == 1:
+		lo = 2 * delta
+	default:
+		hi = 2 * delta
+	}
+	return max(prev-lo, -infinity), min(prev+hi, infinity), delta
+}
+
+// skewRootMoves perturbs the root move order for Lazy-SMP helpers: the k-th
+// helper swaps a different later move into the second slot, so helpers scout a
+// different alternative to the hash move first. Worker 0 and the single searcher
+// leave the order untouched.
+func (s *searcher) skewRootMoves(moves []dragontoothmg.Move) {
+	if s.id <= 0 || len(moves) < 3 {
+		return
+	}
+	j := 1 + (s.id-1)%(len(moves)-1)
+	moves[1], moves[j] = moves[j], moves[1]
+}
+
+// searchRoot searches every legal move at the root inside the window [alpha,
+// beta] and returns the (fail-soft) score of the best one. The first move gets
+// the full window; the rest are scouted with a null window and re-searched only
+// when the scout lands inside. A score at or above beta means a move failed high
+// and the remaining moves were skipped — the caller must widen and retry.
+func (s *searcher) searchRoot(b *dragontoothmg.Board, depth, alpha, beta int) (score int, best dragontoothmg.Move, ok bool) {
+	alphaOrig := alpha
 	key := b.Hash()
 	_, ttMove, _ := s.tt.probe(key, depth, -infinity, infinity, 0)
 
 	moves := s.orderMoves(b, b.GenerateLegalMoves(), ttMove, 0)
-	alpha, beta := -infinity, infinity
+	s.skewRootMoves(moves)
+	s.pvLen[0] = 0
 	bestScore := -infinity
-	for _, m := range moves {
+	for i, m := range moves {
 		unapply := b.Apply(m)
-		v := -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+		var v int
+		if i == 0 {
+			v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+		} else {
+			v = -s.negamax(b, depth-1, -alpha-1, -alpha, 1, true)
+			if v > alpha && v < beta {
+				v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+			}
+		}
 		unapply()
 		if s.stopped {
 			return 0, dragontoothmg.Move(0), false
@@ -213,9 +415,21 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 		}
 		if v > alpha {
 			alpha = v
+			s.setPV(0, m)
+		}
+		if alpha >= beta {
+			break // fail-high: caller widens beta and re-searches
 		}
 	}
-	s.tt.store(key, depth, bestScore, boundExact, best, 0)
+
+	bound := boundExact
+	switch {
+	case bestScore <= alphaOrig:
+		bound = boundUpper
+	case bestScore >= beta:
+		bound = boundLower
+	}
+	s.tt.store(key, depth, bestScore, bound, best, 0)
 	return bestScore, best, true
 }
 
@@ -254,6 +468,9 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 	if v, done := s.terminalScore(b, depth, alpha, beta, ply); done {
 		return v
 	}
+	if ply <= maxPly {
+		s.pvLen[ply] = 0
+	}
 
 	alphaOrig := alpha
 	key := b.Hash()
@@ -287,6 +504,9 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 		}
 		if v > alpha {
 			alpha = v
+			if ply < maxPly {
+				s.setPV(ply, m)
+			}
 		}
 		if alpha >= beta {
 			if isQuiet(b, m) {
@@ -308,9 +528,10 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 }
 
 // searchMove applies m, searches the resulting position, and returns its score
-// from the current side's point of view. Late quiet moves are first searched at
-// a reduced depth (LMR); a reduced search that beats alpha is repeated at full
-// depth so the true score is never lost.
+// from the current side's point of view. This is principal variation search: the
+// first move gets a full window at full depth; every later move is first probed
+// with a null window (and, for late quiets, a reduced depth — LMR), and only
+// re-searched at full depth / full window when that probe beats alpha.
 func (s *searcher) searchMove(b *dragontoothmg.Board, m dragontoothmg.Move, moveIdx, depth, alpha, beta, ply int, inCheck bool) int {
 	quiet := isQuiet(b, m)
 	unapply := b.Apply(m)
@@ -318,17 +539,29 @@ func (s *searcher) searchMove(b *dragontoothmg.Board, m dragontoothmg.Move, move
 	givesCheck := b.OurKingInCheck()
 
 	newDepth := depth - 1
+	if moveIdx == 0 {
+		return -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+	}
+
+	red := 0
 	if depth >= lmrMinDepth && moveIdx >= lmrMinMove && quiet && !inCheck && !givesCheck {
-		red := 1
+		red = 1
 		if moveIdx >= 6 && depth >= 5 {
 			red = 2
 		}
-		v := -s.negamax(b, newDepth-red, -alpha-1, -alpha, ply+1, true)
-		if v <= alpha {
-			return v // stays fail-low even at full depth: no re-search needed
-		}
 	}
-	return -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+
+	v := -s.negamax(b, newDepth-red, -alpha-1, -alpha, ply+1, true)
+	if v > alpha && red > 0 {
+		// The reduction was too aggressive: retry at full depth, still scouting.
+		v = -s.negamax(b, newDepth, -alpha-1, -alpha, ply+1, true)
+	}
+	if v > alpha && v < beta {
+		// Scout landed inside the window: this move may be part of the PV, so
+		// resolve its true score with the full window.
+		v = -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+	}
+	return v
 }
 
 // tryNullMove implements null-move pruning: if handing the opponent a free move
