@@ -3,7 +3,6 @@
 [![CI](https://github.com/cjunius/goChess/actions/workflows/ci.yml/badge.svg)](https://github.com/cjunius/goChess/actions/workflows/ci.yml)
 [![Lint](https://github.com/cjunius/goChess/actions/workflows/lint.yml/badge.svg)](https://github.com/cjunius/goChess/actions/workflows/lint.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cjunius/goChess.svg)](https://pkg.go.dev/github.com/cjunius/goChess)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cjunius/goChess)](https://goreportcard.com/report/github.com/cjunius/goChess)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 A UCI chess engine written in Go, built on the
