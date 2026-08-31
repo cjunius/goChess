@@ -56,6 +56,9 @@ type SearchResult struct {
 	Depth    int
 	Nodes    int64
 	Elapsed  time.Duration
+	// PV is the principal variation for the deepest completed iteration, best
+	// move first. PV[0] equals BestMove whenever the search completed a depth.
+	PV []dragontoothmg.Move
 }
 
 type searcher struct {
@@ -72,6 +75,24 @@ type searcher struct {
 	// so Lazy-SMP workers keep independent tables and need no synchronisation.
 	killers [maxPly + 1][2]dragontoothmg.Move
 	history [2][64][64]int
+
+	// pv is a triangular principal-variation table: pv[ply][:pvLen[ply]] is the
+	// best line found from that ply down, maintained only at nodes that raise
+	// alpha. The root line is pv[0][:pvLen[0]].
+	pv    [maxPly + 1][maxPly + 1]dragontoothmg.Move
+	pvLen [maxPly + 1]int
+}
+
+// setPV records m as the best move at ply and splices the child line at ply+1
+// behind it. Called whenever a move raises alpha.
+func (s *searcher) setPV(ply int, m dragontoothmg.Move) {
+	s.pv[ply][0] = m
+	if ply+1 >= len(s.pv) {
+		s.pvLen[ply] = 1
+		return
+	}
+	n := copy(s.pv[ply][1:], s.pv[ply+1][:s.pvLen[ply+1]])
+	s.pvLen[ply] = n + 1
 }
 
 func (s *searcher) timeUp() bool {
@@ -180,6 +201,7 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 			break // out of time: keep the previous completed depth
 		}
 		res.BestMove, res.Score, res.Depth = move, score, depth
+		res.PV = append(res.PV[:0], s.pv[0][:s.pvLen[0]]...)
 		if score >= mateThreshold || score <= -mateThreshold {
 			if s.stop != nil {
 				s.stop.Store(true) // forced mate: let the other workers stop too
@@ -199,11 +221,21 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 	_, ttMove, _ := s.tt.probe(key, depth, -infinity, infinity, 0)
 
 	moves := s.orderMoves(b, b.GenerateLegalMoves(), ttMove, 0)
+	s.pvLen[0] = 0
 	alpha, beta := -infinity, infinity
 	bestScore := -infinity
-	for _, m := range moves {
+	for i, m := range moves {
 		unapply := b.Apply(m)
-		v := -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+		var v int
+		if i == 0 {
+			v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+		} else {
+			// Null-window scout; re-search with the full window if it beats alpha.
+			v = -s.negamax(b, depth-1, -alpha-1, -alpha, 1, true)
+			if v > alpha {
+				v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
+			}
+		}
 		unapply()
 		if s.stopped {
 			return 0, dragontoothmg.Move(0), false
@@ -213,6 +245,7 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 		}
 		if v > alpha {
 			alpha = v
+			s.setPV(0, m)
 		}
 	}
 	s.tt.store(key, depth, bestScore, boundExact, best, 0)
@@ -254,6 +287,9 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 	if v, done := s.terminalScore(b, depth, alpha, beta, ply); done {
 		return v
 	}
+	if ply <= maxPly {
+		s.pvLen[ply] = 0
+	}
 
 	alphaOrig := alpha
 	key := b.Hash()
@@ -287,6 +323,9 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 		}
 		if v > alpha {
 			alpha = v
+			if ply < maxPly {
+				s.setPV(ply, m)
+			}
 		}
 		if alpha >= beta {
 			if isQuiet(b, m) {
@@ -308,9 +347,10 @@ func (s *searcher) negamax(b *dragontoothmg.Board, depth, alpha, beta, ply int, 
 }
 
 // searchMove applies m, searches the resulting position, and returns its score
-// from the current side's point of view. Late quiet moves are first searched at
-// a reduced depth (LMR); a reduced search that beats alpha is repeated at full
-// depth so the true score is never lost.
+// from the current side's point of view. This is principal variation search: the
+// first move gets a full window at full depth; every later move is first probed
+// with a null window (and, for late quiets, a reduced depth — LMR), and only
+// re-searched at full depth / full window when that probe beats alpha.
 func (s *searcher) searchMove(b *dragontoothmg.Board, m dragontoothmg.Move, moveIdx, depth, alpha, beta, ply int, inCheck bool) int {
 	quiet := isQuiet(b, m)
 	unapply := b.Apply(m)
@@ -318,17 +358,29 @@ func (s *searcher) searchMove(b *dragontoothmg.Board, m dragontoothmg.Move, move
 	givesCheck := b.OurKingInCheck()
 
 	newDepth := depth - 1
+	if moveIdx == 0 {
+		return -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+	}
+
+	red := 0
 	if depth >= lmrMinDepth && moveIdx >= lmrMinMove && quiet && !inCheck && !givesCheck {
-		red := 1
+		red = 1
 		if moveIdx >= 6 && depth >= 5 {
 			red = 2
 		}
-		v := -s.negamax(b, newDepth-red, -alpha-1, -alpha, ply+1, true)
-		if v <= alpha {
-			return v // stays fail-low even at full depth: no re-search needed
-		}
 	}
-	return -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+
+	v := -s.negamax(b, newDepth-red, -alpha-1, -alpha, ply+1, true)
+	if v > alpha && red > 0 {
+		// The reduction was too aggressive: retry at full depth, still scouting.
+		v = -s.negamax(b, newDepth, -alpha-1, -alpha, ply+1, true)
+	}
+	if v > alpha && v < beta {
+		// Scout landed inside the window: this move may be part of the PV, so
+		// resolve its true score with the full window.
+		v = -s.negamax(b, newDepth, -beta, -alpha, ply+1, true)
+	}
+	return v
 }
 
 // tryNullMove implements null-move pruning: if handing the opponent a free move
