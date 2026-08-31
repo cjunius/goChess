@@ -55,6 +55,28 @@ type SearchParams struct {
 	// carried between moves — callers that want that (the UCI layer) pass a
 	// table they own.
 	TT *TT
+
+	// Stop, when non-nil, lets the caller abort the search from another
+	// goroutine. It is checked alongside the internal time-limit flag.
+	Stop *atomic.Bool
+	// Ponder starts the search in pondering mode: the MoveTime budget is ignored
+	// until PonderHit is set (the opponent played the expected move) or Stop is
+	// raised. On the first observation of PonderHit the budget starts counting
+	// from that moment.
+	Ponder    bool
+	PonderHit *atomic.Bool
+	// Info, when non-nil, is called once per completed iteration with the
+	// current best line, for streaming "info" output.
+	Info func(SearchInfo)
+}
+
+// SearchInfo is one iteration's summary, passed to SearchParams.Info.
+type SearchInfo struct {
+	Depth   int
+	Score   int
+	Nodes   int64
+	Elapsed time.Duration
+	PV      []dragontoothmg.Move
 }
 
 // SearchResult is the outcome of a Search call.
@@ -69,13 +91,33 @@ type SearchResult struct {
 	PV []dragontoothmg.Move
 }
 
+// searchOpts bundles the per-call runtime controls shared by every Lazy-SMP
+// worker (all read-only during the search except the atomics).
+type searchOpts struct {
+	tt        *TT
+	stop      *atomic.Bool // internal: set on time-up or a proven mate
+	extStop   *atomic.Bool // caller's abort flag (UCI "stop"), or nil
+	deadline  time.Time    // zero until armed; unset while pondering
+	budget    time.Duration
+	ponder    bool
+	ponderHit *atomic.Bool
+	start     time.Time
+	info      func(SearchInfo)
+}
+
 type searcher struct {
-	tt       *TT
-	stop     *atomic.Bool // shared across Lazy-SMP workers; set once time is up
-	id       int
-	nodes    int64
-	deadline time.Time
-	stopped  bool
+	tt        *TT
+	stop      *atomic.Bool // shared across Lazy-SMP workers; set once time is up
+	extStop   *atomic.Bool
+	id        int
+	nodes     int64
+	deadline  time.Time
+	budget    time.Duration
+	ponder    bool
+	ponderHit *atomic.Bool
+	start     time.Time
+	info      func(SearchInfo) // non-nil only for the reporting worker
+	stopped   bool
 
 	// killers holds, per ply, up to two quiet moves that most recently caused a
 	// beta cut-off at that ply; history accumulates depth^2 for every quiet move
@@ -107,6 +149,20 @@ func (s *searcher) timeUp() bool {
 	if s.stop != nil && s.stop.Load() {
 		return true
 	}
+	if s.extStop != nil && s.extStop.Load() {
+		return true
+	}
+	if s.ponder {
+		// Pondering: ignore the clock until the opponent plays the expected
+		// move, then start the budget from now.
+		if s.ponderHit == nil || !s.ponderHit.Load() {
+			return false
+		}
+		s.ponder = false
+		if s.budget > 0 {
+			s.deadline = time.Now().Add(s.budget)
+		}
+	}
 	if s.deadline.IsZero() {
 		return false
 	}
@@ -137,21 +193,51 @@ func Search(b *dragontoothmg.Board, p SearchParams) SearchResult {
 		return res
 	}
 
-	var deadline time.Time
-	if p.MoveTime > 0 {
-		deadline = start.Add(p.MoveTime)
+	opts := searchOpts{
+		tt:        tt,
+		stop:      new(atomic.Bool),
+		extStop:   p.Stop,
+		budget:    p.MoveTime,
+		ponder:    p.Ponder,
+		ponderHit: p.PonderHit,
+		start:     start,
+		info:      p.Info,
 	}
-	stop := new(atomic.Bool)
+	if p.MoveTime > 0 && !p.Ponder {
+		opts.deadline = start.Add(p.MoveTime)
+	}
 
 	tt.NewSearch()
 	if threads > 1 {
-		res = searchLazySMP(b, p.MaxDepth, deadline, stop, tt, threads)
+		res = searchLazySMP(b, p.MaxDepth, threads, opts)
 	} else {
-		s := &searcher{tt: tt, stop: stop, deadline: deadline}
-		res = s.runIterativeDeepening(b, p.MaxDepth, 1)
+		// Search a copy so a concurrent caller (the UCI read loop) may keep
+		// using its own board while this search runs.
+		board := *b
+		res = newSearcher(0, opts, true).runIterativeDeepening(&board, p.MaxDepth, 1)
 	}
 	res.Elapsed = time.Since(start)
 	return res
+}
+
+// newSearcher builds a worker from the shared options. reporting is true for the
+// single worker that streams Info output.
+func newSearcher(id int, opts searchOpts, reporting bool) *searcher {
+	s := &searcher{
+		tt:        opts.tt,
+		stop:      opts.stop,
+		extStop:   opts.extStop,
+		deadline:  opts.deadline,
+		budget:    opts.budget,
+		ponder:    opts.ponder,
+		ponderHit: opts.ponderHit,
+		start:     opts.start,
+		id:        id,
+	}
+	if reporting {
+		s.info = opts.info
+	}
+	return s
 }
 
 // searchLazySMP runs `threads` workers over one shared transposition table. Each
@@ -159,7 +245,7 @@ func Search(b *dragontoothmg.Board, p SearchParams) SearchResult {
 // a different start depth diverge into different subtrees, and the shared TT
 // lets every worker profit from what the others have already searched. The
 // deepest completed result wins. See https://www.chessprogramming.org/Lazy_SMP.
-func searchLazySMP(b *dragontoothmg.Board, maxDepth int, deadline time.Time, stop *atomic.Bool, tt *TT, threads int) SearchResult {
+func searchLazySMP(b *dragontoothmg.Board, maxDepth, threads int, opts searchOpts) SearchResult {
 	results := make([]SearchResult, threads)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
@@ -173,8 +259,7 @@ func searchLazySMP(b *dragontoothmg.Board, maxDepth int, deadline time.Time, sto
 			if startDepth > maxDepth {
 				startDepth = maxDepth
 			}
-			s := &searcher{tt: tt, stop: stop, deadline: deadline, id: id}
-			results[id] = s.runIterativeDeepening(&board, maxDepth, startDepth)
+			results[id] = newSearcher(id, opts, id == 0).runIterativeDeepening(&board, maxDepth, startDepth)
 		}(i)
 	}
 	wg.Wait()
@@ -213,6 +298,15 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 		res.BestMove, res.Score, res.Depth = move, score, depth
 		res.PV = append(res.PV[:0], s.pv[0][:s.pvLen[0]]...)
 		prevScore = score
+		if s.info != nil {
+			s.info(SearchInfo{
+				Depth:   depth,
+				Score:   score,
+				Nodes:   s.nodes,
+				Elapsed: time.Since(s.start),
+				PV:      res.PV,
+			})
+		}
 		if score >= mateThreshold || score <= -mateThreshold {
 			if s.stop != nil {
 				s.stop.Store(true) // forced mate: let the other workers stop too

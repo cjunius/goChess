@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cjunius/goChess/internal/uci"
 )
@@ -123,5 +124,74 @@ func TestStopAndUnknownGoArgsAreHarmless(t *testing.T) {
 	out := run(t, "position startpos\ngo depth 2 winc 100 movestogo 40\nstop\nquit\n")
 	if !strings.Contains(out, "bestmove ") {
 		t.Errorf("expected a bestmove:\n%s", out)
+	}
+}
+
+func TestUciAdvertisesPonderOption(t *testing.T) {
+	out := run(t, "uci\nquit\n")
+	if !strings.Contains(out, "option name Ponder type check default false") {
+		t.Errorf("missing Ponder option:\n%s", out)
+	}
+}
+
+func TestInfiniteSearchStopsOnStop(t *testing.T) {
+	start := time.Now()
+	out := run(t, "position startpos\ngo infinite\nstop\nquit\n")
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("infinite search took %s to stop", elapsed)
+	}
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+}
+
+func TestPonderHitReleasesBestMove(t *testing.T) {
+	// White has mate in one (a1a8). Pondering, then ponderhit lets the search
+	// spend its budget, find the mate and report it.
+	out := run(t, strings.Join([]string{
+		"position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1",
+		"go ponder movetime 2000",
+		"ponderhit",
+		"quit",
+		"",
+	}, "\n"))
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "bestmove a1a8") {
+		t.Errorf("want 'bestmove a1a8' after ponderhit:\n%s", out)
+	}
+}
+
+func TestPonderStopReleasesBestMoveWithoutHit(t *testing.T) {
+	start := time.Now()
+	out := run(t, strings.Join([]string{
+		"position startpos moves e2e4",
+		"go ponder wtime 60000 btime 60000",
+		"stop",
+		"quit",
+		"",
+	}, "\n"))
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("pondering search took %s to stop after 'stop'", elapsed)
+	}
+	if n := strings.Count(out, "bestmove"); n != 1 {
+		t.Fatalf("want exactly one bestmove, got %d:\n%s", n, out)
+	}
+}
+
+func TestBestMoveCarriesPonderMove(t *testing.T) {
+	out := run(t, "position startpos\ngo depth 6\nquit\n")
+	if !strings.Contains(out, "bestmove ") {
+		t.Fatalf("no bestmove:\n%s", out)
+	}
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "bestmove ") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, " ponder ") {
+		t.Errorf("bestmove line has no ponder move: %q", line)
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dylhunn/dragontoothmg"
@@ -35,10 +37,27 @@ const (
 type session struct {
 	board   dragontoothmg.Board
 	out     io.Writer
+	mu      sync.Mutex // guards writes to out and the search field
 	tt      *engine.TT
 	hashMB  int
 	threads int
+	ponder  bool // the "Ponder" option; a GUI only sends "go ponder" when set
+	search  *activeSearch
 }
+
+// activeSearch tracks the goroutine running the current search so "stop",
+// "ponderhit" and "quit" can reach it.
+type activeSearch struct {
+	stop      *atomic.Bool
+	ponderHit *atomic.Bool
+	bounded   bool          // has a depth or movetime limit and is not pondering
+	hasBudget bool          // a movetime / clock budget was given
+	release   chan struct{} // closed on ponderhit or stop; gates the bestmove
+	relOnce   sync.Once
+	done      chan struct{} // closed once bestmove has been emitted
+}
+
+func (as *activeSearch) signalRelease() { as.relOnce.Do(func() { close(as.release) }) }
 
 // Run reads UCI commands from r and writes responses to w until "quit" or EOF.
 // version is reported in the "id name" line.
@@ -59,34 +78,49 @@ func Run(r io.Reader, w io.Writer, version string) error {
 		}
 		switch fields[0] {
 		case "uci":
-			fmt.Fprintf(w, "id name %s %s\n", engineName, version)
-			fmt.Fprintf(w, "id author %s\n", engineAuthor)
-			fmt.Fprintf(w, "option name Hash type spin default %d min %d max %d\n", defaultHashMB, minHashMB, maxHashMB)
-			fmt.Fprintf(w, "option name Threads type spin default %d min 1 max %d\n", defaultThreads, maxThreads)
-			fmt.Fprintln(w, "uciok")
+			s.emit("id name %s %s\n", engineName, version)
+			s.emit("id author %s\n", engineAuthor)
+			s.emit("option name Hash type spin default %d min %d max %d\n", defaultHashMB, minHashMB, maxHashMB)
+			s.emit("option name Threads type spin default %d min 1 max %d\n", defaultThreads, maxThreads)
+			s.emit("option name Ponder type check default false\n")
+			s.emit("uciok\n")
 		case "isready":
 			s.ensureTT()
-			fmt.Fprintln(w, "readyok")
+			s.emit("readyok\n")
 		case "setoption":
 			s.handleSetOption(fields[1:])
 		case "ucinewgame":
+			s.stopSearch()
 			s.board = dragontoothmg.ParseFen(dragontoothmg.Startpos)
 			if s.tt != nil {
 				s.tt.Clear()
 			}
 		case "position":
+			s.stopSearch()
 			s.handlePosition(fields[1:])
 		case "go":
 			s.handleGo(fields[1:])
 		case "stop":
-			// Search is synchronous, so there is nothing to interrupt.
+			s.stopSearch()
+		case "ponderhit":
+			s.ponderHit()
 		case "d":
-			fmt.Fprintln(w, s.board.ToFen())
+			s.emit("%s\n", s.board.ToFen())
 		case "quit":
+			s.endSearch(true)
 			return nil
 		}
 	}
+	s.endSearch(true)
 	return sc.Err()
+}
+
+// emit writes one formatted line to out under the mutex, so the search goroutine
+// and the command loop never interleave output.
+func (s *session) emit(format string, args ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(s.out, format, args...)
 }
 
 // ensureTT lazily allocates the transposition table at the configured size.
@@ -94,6 +128,43 @@ func (s *session) ensureTT() {
 	if s.tt == nil {
 		s.tt = engine.NewTT(s.hashMB)
 	}
+}
+
+// stopSearch aborts the running search (if any) and blocks until its bestmove
+// has been emitted.
+func (s *session) stopSearch() { s.endSearch(false) }
+
+// endSearch blocks until the running search (if any) has emitted its bestmove.
+// It aborts the search unless graceful is set and the search is guaranteed to
+// finish on its own soon (a fixed depth / movetime search a GUI is waiting on,
+// or a pondering search that already got its ponderhit and has a budget). A
+// "quit" or EOF must never hang on an infinite or still-pondering search.
+func (s *session) endSearch(graceful bool) {
+	s.mu.Lock()
+	as := s.search
+	s.mu.Unlock()
+	if as == nil {
+		return
+	}
+	willFinish := as.bounded || (as.hasBudget && as.ponderHit.Load())
+	if !graceful || !willFinish {
+		as.stop.Store(true)
+	}
+	as.signalRelease()
+	<-as.done
+}
+
+// ponderhit tells a pondering search that the opponent played the expected move,
+// so it should start spending its time budget and report as normal.
+func (s *session) ponderHit() {
+	s.mu.Lock()
+	as := s.search
+	s.mu.Unlock()
+	if as == nil {
+		return
+	}
+	as.ponderHit.Store(true)
+	as.signalRelease()
 }
 
 // handleSetOption parses "setoption name <Name> value <Value>" for the options
@@ -119,6 +190,7 @@ func (s *session) handleSetOption(args []string) {
 	switch strings.ToLower(name) {
 	case "hash":
 		if n, err := strconv.Atoi(value); err == nil {
+			s.stopSearch()
 			s.hashMB = clamp(n, minHashMB, maxHashMB)
 			s.tt = engine.NewTT(s.hashMB) // resize now, before the next search
 		}
@@ -126,6 +198,8 @@ func (s *session) handleSetOption(args []string) {
 		if n, err := strconv.Atoi(value); err == nil {
 			s.threads = clamp(n, 1, maxThreads)
 		}
+	case "ponder":
+		s.ponder = strings.EqualFold(value, "true")
 	}
 }
 
@@ -170,12 +244,22 @@ func (s *session) handlePosition(args []string) {
 }
 
 func (s *session) handleGo(args []string) {
-	params := engine.SearchParams{}
-	var wtime, btime, movetime time.Duration
+	s.stopSearch()
 
-	// Scan for the keywords we support, each followed by an integer argument.
-	// Unknown keywords (movestogo, winc, ponder, ...) are ignored.
-	for i := 0; i < len(args)-1; i++ {
+	var params engine.SearchParams
+	var wtime, btime, winc, binc, movetime time.Duration
+	ponder := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "ponder":
+			ponder = true
+		case "infinite":
+			params.MaxDepth = 0
+		}
+		if i+1 >= len(args) {
+			break
+		}
 		switch args[i] {
 		case "depth":
 			if d, err := strconv.Atoi(args[i+1]); err == nil {
@@ -187,16 +271,20 @@ func (s *session) handleGo(args []string) {
 			wtime = millis(args[i+1])
 		case "btime":
 			btime = millis(args[i+1])
+		case "winc":
+			winc = millis(args[i+1])
+		case "binc":
+			binc = millis(args[i+1])
 		}
 	}
 
 	if movetime == 0 {
-		remaining := btime
+		remaining, inc := btime, binc
 		if s.board.Wtomove {
-			remaining = wtime
+			remaining, inc = wtime, winc
 		}
 		if remaining > 0 {
-			movetime = remaining / clockDivisor
+			movetime = remaining/clockDivisor + inc*3/4
 		}
 	}
 	params.MoveTime = movetime
@@ -208,17 +296,67 @@ func (s *session) handleGo(args []string) {
 		params.Threads = n // never spawn more workers than the machine has cores
 	}
 
-	res := engine.Search(&s.board, params)
-	if res.Depth > 0 {
-		fmt.Fprintf(s.out, "info depth %d score %s nodes %d time %d pv %s\n",
-			res.Depth, scoreString(res.Score), res.Nodes, res.Elapsed.Milliseconds(), res.BestMove.String())
+	as := &activeSearch{
+		stop:      new(atomic.Bool),
+		ponderHit: new(atomic.Bool),
+		bounded:   !ponder && (params.MaxDepth > 0 || params.MoveTime > 0),
+		hasBudget: params.MoveTime > 0,
+		release:   make(chan struct{}),
+		done:      make(chan struct{}),
 	}
-	best := res.BestMove.String()
-	if best == "0000" {
-		fmt.Fprintln(s.out, "bestmove (none)")
+	if !ponder {
+		as.signalRelease() // no ponder handshake: emit the bestmove as soon as it's ready
+	}
+	params.Stop = as.stop
+	params.Ponder = ponder
+	params.PonderHit = as.ponderHit
+	params.Info = s.infoPrinter()
+
+	s.mu.Lock()
+	s.search = as
+	s.mu.Unlock()
+
+	board := s.board
+	go func() {
+		res := engine.Search(&board, params)
+		<-as.release // wait for ponderhit / stop before moving
+		s.emitBestMove(res)
+		s.mu.Lock()
+		s.search = nil
+		s.mu.Unlock()
+		close(as.done)
+	}()
+}
+
+// infoPrinter returns the per-iteration callback that streams "info" lines.
+func (s *session) infoPrinter() func(engine.SearchInfo) {
+	return func(in engine.SearchInfo) {
+		var pv strings.Builder
+		for i, m := range in.PV {
+			if i > 0 {
+				pv.WriteByte(' ')
+			}
+			pv.WriteString(m.String())
+		}
+		var nps int64
+		if in.Elapsed > 0 {
+			nps = in.Nodes * int64(time.Second) / int64(in.Elapsed)
+		}
+		s.emit("info depth %d score %s nodes %d nps %d time %d pv %s\n",
+			in.Depth, scoreString(in.Score), in.Nodes, nps, in.Elapsed.Milliseconds(), pv.String())
+	}
+}
+
+func (s *session) emitBestMove(res engine.SearchResult) {
+	if res.BestMove == 0 || res.BestMove.String() == "0000" {
+		s.emit("bestmove (none)\n")
 		return
 	}
-	fmt.Fprintf(s.out, "bestmove %s\n", best)
+	if len(res.PV) >= 2 {
+		s.emit("bestmove %s ponder %s\n", res.BestMove.String(), res.PV[1].String())
+		return
+	}
+	s.emit("bestmove %s\n", res.BestMove.String())
 }
 
 func millis(s string) time.Duration {

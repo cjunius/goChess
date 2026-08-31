@@ -64,15 +64,21 @@ unapply closure), FEN parsing, an incrementally-updated Zobrist hash
 
 A line-oriented reader for `uci`, `isready`, `setoption`, `ucinewgame`,
 `position` (`startpos` / `fen`, with `moves`), `go` (`depth`, `movetime`,
-`wtime`/`btime`), `stop`, `d`, and `quit`. It owns the persistent `engine.TT`
-(sized by the `Hash` option, cleared on `ucinewgame`) and the `Threads` setting.
-Search is synchronous, so `stop` is a no-op and `bestmove` is emitted as soon as
-`go` returns.
+`wtime`/`btime`/`winc`/`binc`, `infinite`, `ponder`), `stop`, `ponderhit`, `d`,
+and `quit`. It owns the persistent `engine.TT` (sized by the `Hash` option,
+cleared on `ucinewgame`) and the `Threads` / `Ponder` settings.
+
+Search runs on its own goroutine: `go` returns immediately, `engine.Search`
+streams `info` lines through a callback and the goroutine emits `bestmove`
+(with a `ponder` move from the PV) once the search ends. `stop` aborts it;
+`ponderhit` converts a pondering search onto its time budget; a mutex serialises
+all writes to stdout. `quit` / EOF wait for a bounded search a GUI is blocking on
+and abort anything infinite.
 
 ## Deliberately not here yet
 
-Aspiration windows, principal variation search, static exchange evaluation,
-search extensions, opening book, tablebases, pondering, `SearchMoves`/`MultiPV`.
+Static exchange evaluation, search extensions, opening book, tablebases,
+`SearchMoves`/`MultiPV`.
 
 ## Key invariants
 
