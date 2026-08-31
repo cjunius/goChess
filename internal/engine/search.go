@@ -143,6 +143,7 @@ func Search(b *dragontoothmg.Board, p SearchParams) SearchResult {
 	}
 	stop := new(atomic.Bool)
 
+	tt.NewSearch()
 	if threads > 1 {
 		res = searchLazySMP(b, p.MaxDepth, deadline, stop, tt, threads)
 	} else {
@@ -235,9 +236,7 @@ func (s *searcher) searchDepth(b *dragontoothmg.Board, depth, prevScore int) (in
 		return s.searchRoot(b, depth, -infinity, infinity)
 	}
 
-	delta := aspBaseDelta
-	alpha := max(prevScore-delta, -infinity)
-	beta := min(prevScore+delta, infinity)
+	alpha, beta, delta := s.aspWindow(prevScore)
 	for {
 		score, move, ok := s.searchRoot(b, depth, alpha, beta)
 		if !ok {
@@ -259,6 +258,35 @@ func (s *searcher) searchDepth(b *dragontoothmg.Board, depth, prevScore int) (in
 	}
 }
 
+// aspWindow returns the initial aspiration window and delta for this searcher.
+// Lazy-SMP helpers (id > 0) widen the delta and skew the window asymmetrically
+// so they hit fail-high / fail-low boundaries at different points than worker 0,
+// diverging onto different parts of the tree.
+func (s *searcher) aspWindow(prev int) (alpha, beta, delta int) {
+	delta = aspBaseDelta + 10*s.id
+	lo, hi := delta, delta
+	switch {
+	case s.id == 0:
+	case s.id&1 == 1:
+		lo = 2 * delta
+	default:
+		hi = 2 * delta
+	}
+	return max(prev-lo, -infinity), min(prev+hi, infinity), delta
+}
+
+// skewRootMoves perturbs the root move order for Lazy-SMP helpers: the k-th
+// helper swaps a different later move into the second slot, so helpers scout a
+// different alternative to the hash move first. Worker 0 and the single searcher
+// leave the order untouched.
+func (s *searcher) skewRootMoves(moves []dragontoothmg.Move) {
+	if s.id <= 0 || len(moves) < 3 {
+		return
+	}
+	j := 1 + (s.id-1)%(len(moves)-1)
+	moves[1], moves[j] = moves[j], moves[1]
+}
+
 // searchRoot searches every legal move at the root inside the window [alpha,
 // beta] and returns the (fail-soft) score of the best one. The first move gets
 // the full window; the rest are scouted with a null window and re-searched only
@@ -270,6 +298,7 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth, alpha, beta int) (s
 	_, ttMove, _ := s.tt.probe(key, depth, -infinity, infinity, 0)
 
 	moves := s.orderMoves(b, b.GenerateLegalMoves(), ttMove, 0)
+	s.skewRootMoves(moves)
 	s.pvLen[0] = 0
 	bestScore := -infinity
 	for i, m := range moves {

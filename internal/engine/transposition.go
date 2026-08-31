@@ -37,7 +37,8 @@ type ttEntry struct {
 //	bits 16..47  score, int32 two's-complement (mate scores need > 16 bits)
 //	bits 48..55  depth, uint8
 //	bits 56..57  bound flag
-func packTT(move dragontoothmg.Move, score, depth, bound int) uint64 {
+//	bits 58..63  generation (6-bit search counter, for ageing)
+func packTT(move dragontoothmg.Move, score, depth, bound, gen int) uint64 {
 	switch {
 	case depth < 0:
 		depth = 0
@@ -49,14 +50,16 @@ func packTT(move dragontoothmg.Move, score, depth, bound int) uint64 {
 	return uint64(uint16(move)) |
 		(uint64(uint32(score)) << 16) | //nolint:gosec // deliberate low-32-bit pack; unpackTT restores the sign
 		(uint64(depth&0xff) << 48) |
-		(uint64(bound&3) << 56)
+		(uint64(bound&3) << 56) |
+		(uint64(gen&0x3f) << 58)
 }
 
-func unpackTT(data uint64) (move dragontoothmg.Move, score, depth, bound int) {
+func unpackTT(data uint64) (move dragontoothmg.Move, score, depth, bound, gen int) {
 	move = dragontoothmg.Move(data & 0xffff)
 	score = int(int32(data >> 16)) //nolint:gosec // sign-extend the packed int32 score
 	depth = int((data >> 48) & 0xff)
 	bound = int((data >> 56) & 3)
+	gen = int((data >> 58) & 0x3f)
 	return
 }
 
@@ -66,6 +69,10 @@ func unpackTT(data uint64) (move dragontoothmg.Move, score, depth, bound int) {
 type TT struct {
 	entries []ttEntry
 	mask    uint64
+	// gen is bumped once per search (NewSearch). store treats entries from an
+	// older generation as free space, so a new search reclaims the previous
+	// search's table instead of being blocked by its deeper entries.
+	gen atomic.Uint32
 }
 
 // NewTT returns a table that occupies about mb megabytes, rounded down to the
@@ -80,6 +87,13 @@ func NewTT(mb int) *TT {
 		size <<= 1
 	}
 	return &TT{entries: make([]ttEntry, size), mask: size - 1}
+}
+
+// NewSearch advances the table's generation. Call it once at the start of every
+// search so entries left by the previous search become preferentially
+// replaceable (see store).
+func (t *TT) NewSearch() {
+	t.gen.Add(1)
 }
 
 // Clear empties every slot. Call it between games (UCI "ucinewgame"); stale
@@ -103,7 +117,7 @@ func (t *TT) probe(key uint64, depth, alpha, beta, ply int) (score int, move dra
 	if data == 0 || lock^data != key {
 		return 0, 0, false
 	}
-	m, eScore, eDepth, bound := unpackTT(data)
+	m, eScore, eDepth, bound, _ := unpackTT(data)
 	if eDepth < depth {
 		return 0, m, false
 	}
@@ -123,16 +137,19 @@ func (t *TT) probe(key uint64, depth, alpha, beta, ply int) (score int, move dra
 	return 0, m, false
 }
 
-// store records a result for key. A shallower existing entry for the same key is
-// overwritten; a deeper one is kept.
+// store records a result for key. An existing entry is kept only when it is for
+// the same key, from the current generation, and searched deeper — so within one
+// search the table is depth-preferred, but a new search (NewSearch) overwrites
+// the previous one's entries regardless of their depth.
 func (t *TT) store(key uint64, depth, score, bound int, move dragontoothmg.Move, ply int) {
+	gen := int(t.gen.Load() & 0x3f)
 	e := &t.entries[key&t.mask]
 	if old := e.data.Load(); old != 0 && e.lock.Load()^old == key {
-		if _, _, oldDepth, _ := unpackTT(old); oldDepth > depth {
+		if _, _, oldDepth, _, oldGen := unpackTT(old); oldGen == gen && oldDepth > depth {
 			return
 		}
 	}
-	data := packTT(move, ttStoreScore(score, ply), depth, bound)
+	data := packTT(move, ttStoreScore(score, ply), depth, bound, gen)
 	e.lock.Store(key ^ data)
 	e.data.Store(data)
 }
