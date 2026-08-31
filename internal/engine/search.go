@@ -30,6 +30,14 @@ const (
 	// historyMax caps a history counter so repeated cut-offs cannot dwarf the
 	// capture scores in move ordering.
 	historyMax = 1 << 22
+
+	// Aspiration windows: from aspMinDepth, each iteration first searches a
+	// window aspBaseDelta wide centred on the previous score, doubling the delta
+	// on the side that fails until the score lands inside or the window has
+	// grown past aspMaxDelta (at which point it opens fully).
+	aspMinDepth  = 5
+	aspBaseDelta = 25
+	aspMaxDelta  = 400
 )
 
 // SearchParams controls a single Search call.
@@ -195,13 +203,15 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 	}
 	res.BestMove = root[0]
 
+	prevScore := 0
 	for depth := startDepth; depth <= maxDepth; depth++ {
-		score, move, ok := s.searchRoot(b, depth)
+		score, move, ok := s.searchDepth(b, depth, prevScore)
 		if !ok {
 			break // out of time: keep the previous completed depth
 		}
 		res.BestMove, res.Score, res.Depth = move, score, depth
 		res.PV = append(res.PV[:0], s.pv[0][:s.pvLen[0]]...)
+		prevScore = score
 		if score >= mateThreshold || score <= -mateThreshold {
 			if s.stop != nil {
 				s.stop.Store(true) // forced mate: let the other workers stop too
@@ -216,13 +226,51 @@ func (s *searcher) runIterativeDeepening(b *dragontoothmg.Board, maxDepth, start
 	return res
 }
 
-func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, best dragontoothmg.Move, ok bool) {
+// searchDepth runs one iterative-deepening iteration for depth. From aspMinDepth
+// it wraps searchRoot in an aspiration window centred on the previous score,
+// widening the failing side until the score lands inside; shallow depths and
+// positions with a known mate score search the full window directly.
+func (s *searcher) searchDepth(b *dragontoothmg.Board, depth, prevScore int) (int, dragontoothmg.Move, bool) {
+	if depth < aspMinDepth || prevScore >= mateThreshold || prevScore <= -mateThreshold {
+		return s.searchRoot(b, depth, -infinity, infinity)
+	}
+
+	delta := aspBaseDelta
+	alpha := max(prevScore-delta, -infinity)
+	beta := min(prevScore+delta, infinity)
+	for {
+		score, move, ok := s.searchRoot(b, depth, alpha, beta)
+		if !ok {
+			return 0, dragontoothmg.Move(0), false
+		}
+		switch {
+		case score <= alpha:
+			alpha = max(alpha-delta, -infinity)
+			delta *= 2
+		case score >= beta:
+			beta = min(beta+delta, infinity)
+			delta *= 2
+		default:
+			return score, move, true
+		}
+		if delta > aspMaxDelta {
+			alpha, beta = -infinity, infinity
+		}
+	}
+}
+
+// searchRoot searches every legal move at the root inside the window [alpha,
+// beta] and returns the (fail-soft) score of the best one. The first move gets
+// the full window; the rest are scouted with a null window and re-searched only
+// when the scout lands inside. A score at or above beta means a move failed high
+// and the remaining moves were skipped — the caller must widen and retry.
+func (s *searcher) searchRoot(b *dragontoothmg.Board, depth, alpha, beta int) (score int, best dragontoothmg.Move, ok bool) {
+	alphaOrig := alpha
 	key := b.Hash()
 	_, ttMove, _ := s.tt.probe(key, depth, -infinity, infinity, 0)
 
 	moves := s.orderMoves(b, b.GenerateLegalMoves(), ttMove, 0)
 	s.pvLen[0] = 0
-	alpha, beta := -infinity, infinity
 	bestScore := -infinity
 	for i, m := range moves {
 		unapply := b.Apply(m)
@@ -230,9 +278,8 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 		if i == 0 {
 			v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
 		} else {
-			// Null-window scout; re-search with the full window if it beats alpha.
 			v = -s.negamax(b, depth-1, -alpha-1, -alpha, 1, true)
-			if v > alpha {
+			if v > alpha && v < beta {
 				v = -s.negamax(b, depth-1, -beta, -alpha, 1, true)
 			}
 		}
@@ -247,8 +294,19 @@ func (s *searcher) searchRoot(b *dragontoothmg.Board, depth int) (score int, bes
 			alpha = v
 			s.setPV(0, m)
 		}
+		if alpha >= beta {
+			break // fail-high: caller widens beta and re-searches
+		}
 	}
-	s.tt.store(key, depth, bestScore, boundExact, best, 0)
+
+	bound := boundExact
+	switch {
+	case bestScore <= alphaOrig:
+		bound = boundUpper
+	case bestScore >= beta:
+		bound = boundLower
+	}
+	s.tt.store(key, depth, bestScore, bound, best, 0)
 	return bestScore, best, true
 }
 
