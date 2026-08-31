@@ -267,19 +267,26 @@ func (s *session) handlePosition(args []string) {
 	}
 }
 
-func (s *session) handleGo(args []string) {
-	s.stopSearch()
+// goLimits is the parsed subset of a "go" command's arguments.
+type goLimits struct {
+	maxDepth int
+	movetime time.Duration
+	ponder   bool
+}
 
-	var params engine.SearchParams
-	var wtime, btime, winc, binc, movetime time.Duration
-	ponder := false
+// parseGoArgs reads the "go" keywords goChess supports. Unknown keywords
+// (movestogo, mate, searchmoves, …) are ignored. whiteToMove selects which
+// side's clock feeds the time budget.
+func parseGoArgs(args []string, whiteToMove bool) goLimits {
+	var g goLimits
+	var wtime, btime, winc, binc time.Duration
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "ponder":
-			ponder = true
+			g.ponder = true
 		case "infinite":
-			params.MaxDepth = 0
+			g.maxDepth = 0
 		}
 		if i+1 >= len(args) {
 			break
@@ -287,10 +294,10 @@ func (s *session) handleGo(args []string) {
 		switch args[i] {
 		case "depth":
 			if d, err := strconv.Atoi(args[i+1]); err == nil {
-				params.MaxDepth = d
+				g.maxDepth = d
 			}
 		case "movetime":
-			movetime = millis(args[i+1])
+			g.movetime = millis(args[i+1])
 		case "wtime":
 			wtime = millis(args[i+1])
 		case "btime":
@@ -302,16 +309,24 @@ func (s *session) handleGo(args []string) {
 		}
 	}
 
-	if movetime == 0 {
+	if g.movetime == 0 {
 		remaining, inc := btime, binc
-		if s.board.Wtomove {
+		if whiteToMove {
 			remaining, inc = wtime, winc
 		}
 		if remaining > 0 {
-			movetime = remaining/clockDivisor + inc*3/4
+			g.movetime = remaining/clockDivisor + inc*3/4
 		}
 	}
-	params.MoveTime = movetime
+	return g
+}
+
+func (s *session) handleGo(args []string) {
+	s.stopSearch()
+
+	g := parseGoArgs(args, s.board.Wtomove)
+	ponder := g.ponder
+	params := engine.SearchParams{MaxDepth: g.maxDepth, MoveTime: g.movetime}
 
 	// An in-book move short-circuits the search entirely (but never while
 	// pondering — there is nothing to ponder on a book move).

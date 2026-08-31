@@ -136,8 +136,8 @@ func decodePolyglotMove(pm uint16, b *dragontoothmg.Board) (dragontoothmg.Move, 
 	to := int((pm>>3)&7)*8 + int(pm&7)
 
 	var mv dragontoothmg.Move
-	mv.Setfrom(dragontoothmg.Square(from)) //nolint:gosec // 0..63
-	mv.Setto(dragontoothmg.Square(to))     //nolint:gosec // 0..63
+	mv.Setfrom(dragontoothmg.Square(from))
+	mv.Setto(dragontoothmg.Square(to))
 	switch (pm >> 12) & 7 {
 	case 1:
 		mv.Setpromote(dragontoothmg.Knight)
