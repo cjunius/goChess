@@ -25,9 +25,10 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
   valuable victim, least valuable attacker), then the two killer moves for the
   ply, then quiet moves by history score. Good ordering is what makes alpha-beta
   actually prune, and it is also what makes null-move pruning and LMR safe.
-- **Evaluation** — material values + Michniewski piece-square tables + a
-  bishop-pair bonus. Crude, but it captures development, central control, king
-  placement and the two-bishop advantage.
+- **Evaluation** — tapered PeSTO material and piece-square tables plus
+  bishop-pair, passed-pawn, mobility, king-safety and tempo terms. Untuned, but
+  it captures development, central control, king safety, the two-bishop
+  advantage, and the middlegame/endgame shift.
 - **Compiled and fast** — ~2.5M nodes/sec in a single thread on an Apple M4
   (`gochess bench`), and Lazy SMP puts the other cores to work. That is ~50–60×
   the node rate of a typical Python engine, so effective search depth is
@@ -55,6 +56,17 @@ until [the strength-testing harness](#measuring-it-properly) produces real data.
   nulls).
 - **Late move reductions.** Late quiet moves are searched 1–2 ply shallower and
   re-searched at full depth only when the reduced search beats alpha.
+- **Principal variation search + aspiration windows.** Only the first move at a
+  node gets a full window; the rest are null-window scouts. From depth 5 each
+  iteration starts inside a ±25 cp window around the previous score.
+- **Tapered PeSTO evaluation** with passed-pawn, mobility and king-safety terms,
+  replacing the single Michniewski PST set.
+- **Asynchronous search** — `stop` aborts immediately and pondering
+  (`go ponder` / `ponderhit`) lets the engine think on the opponent's clock.
+- **TT ageing + richer Lazy SMP** — a generation counter reclaims the previous
+  search's entries, and helper workers skew their root move order and aspiration
+  window.
+- **Polyglot opening book** (`OwnBook` / `BookFile`).
 
 Together these cut a depth-8 search from the opening from ~5.9M nodes to ~167k
 and let the single-threaded search reach depth 12 in roughly the time depth 8
@@ -62,37 +74,34 @@ used to cost. See [performance.md](performance.md).
 
 ### Limiting factors
 
-- **No aspiration windows or principal variation search.** Every move past the
-  first at a node is still searched with a full window (LMR aside), so the
-  alpha-beta tree is wider than a PVS engine's.
 - **No search extensions** (check extensions, singular extensions). Tactical
   lines that need one extra ply past the horizon are missed.
-- **Hand-set evaluation weights, never tuned.** No Texel tuning, no
-  game-phase interpolation (a single PST set is used from opening to endgame),
-  no explicit terms for passed pawns, pawn structure, mobility, rook-on-open-
-  file, or king safety beyond the king PST.
-- **Thin endgame play.** No tablebase probing, no KPK / KBNK knowledge, no
+- **Hand-set evaluation weights, never tuned.** The tapered PeSTO tables and the
+  passed-pawn / mobility / king-safety coefficients are literature defaults, not
+  Texel- or gradient-tuned for this engine. No isolated/doubled/backward pawn,
+  rook-on-open-file or outpost terms yet.
+- **Thin endgame play.** No tablebase probing (see
+  [ADR 0003](adr/0003-defer-syzygy-tablebases.md)), no KPK / KBNK knowledge, no
   contempt. The 50-move rule is honoured but threefold repetition is not
   detected inside the search.
-- **Basic Lazy SMP only.** Workers share the TT and start at staggered depths,
-  but there is no root-move splitting, aspiration-window skew, or TT ageing, so
-  parallel scaling past a handful of threads is modest.
-- **Synchronous search.** `stop` is a no-op and there is no pondering, so the
-  engine cannot think on the opponent's clock or bail out of a bad time
-  allocation.
+- **Lazy SMP is still "lazy".** Helpers skew their root order and aspiration
+  window and the TT is aged, but there is no explicit root-move splitting or
+  shared-PV coordination, so scaling past a handful of threads is modest.
+- **No SEE.** Captures are ordered by MVV-LVA only; losing captures are not
+  pruned in quiescence.
 
 ## Calibration against known engines
 
 | Reference engine | ~CCRL blitz | Relevant comparison |
 | ---------------- | ----------- | ------------------- |
 | TSCP 1.81 | ~1700 | Similar search shape but no null-move / LMR. goChess should now be clearly stronger. |
-| Sungorus 1.4 | ~2000 | TT + null-move + PVS + killers — the closest match to goChess's current feature set. goChess should land near here, held back by the cruder evaluation and the missing PVS. |
-| CT800 / Claudia class | ~2100+ | Full modern pruning set plus a tuned eval. Reachable once aspiration/PVS and a tapered, tuned evaluation land. |
+| Sungorus 1.4 | ~2000 | TT + null-move + PVS + killers — a close match to goChess's search feature set. goChess should be around here or a little above. |
+| CT800 / Claudia class | ~2100+ | Full modern pruning set plus a tuned eval. Reachable once the evaluation weights are tuned and a few structural terms are added. |
 
-The feature set now resembles a "complete first-generation pruning engine" —
-tactically sharp for its node rate, still positionally simplistic (one untuned
-PST set, no pawn-structure or king-safety terms), so the evaluation is the main
-thing left holding the rating down.
+The feature set now resembles a "complete first-generation pruning engine" with
+a tapered evaluation — tactically sharp for its node rate; the remaining
+positional gaps (untuned weights, no pawn-structure or outpost terms) are the
+main thing left holding the rating down.
 
 ## Time-control sensitivity
 
@@ -118,16 +127,17 @@ assuming each is implemented competently and validated by SPRT:
 | Killer moves + history heuristic | +50 to +100 | done, pending SPRT |
 | Null-move pruning | +50 to +80 | done, pending SPRT |
 | Late move reductions | +50 to +100 | done, pending SPRT |
-| Aspiration windows / PVS | +20 to +50 | |
-| Game-phase eval interpolation (tapered eval) | +30 to +60 | |
-| Passed pawns / king safety / mobility terms | +40 to +80 | |
+| Aspiration windows / PVS | +20 to +50 | done, pending SPRT |
+| Game-phase eval interpolation (tapered eval) | +30 to +60 | done, pending SPRT |
+| Passed pawns / king safety / mobility terms | +40 to +80 | done, pending SPRT |
 | Texel-tuned evaluation weights | +40 to +80 | |
-| Opening book (Polyglot) | +20 to +40 at short TC | |
-| Syzygy tablebase probing | +10 to +20 | |
+| Opening book (Polyglot) | +20 to +40 at short TC | done, pending SPRT |
+| Syzygy tablebase probing | +10 to +20 | deferred ([ADR 0003](adr/0003-defer-syzygy-tablebases.md)) |
 
-With the TT, Lazy SMP, killers/history, null-move pruning and LMR all in,
-goChess plausibly sits in the ~1900–2150 range; a tapered, tuned evaluation with
-pawn-structure and king-safety terms on top is what targets 2300+.
+With the TT, Lazy SMP, killers/history, null-move pruning, LMR, PVS/aspiration
+and a tapered evaluation all in, goChess plausibly sits in the ~2000–2250 range;
+tuning the evaluation weights and adding a few structural terms is what targets
+2300+.
 
 ## Measuring it properly
 
